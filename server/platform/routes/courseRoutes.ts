@@ -8,10 +8,10 @@ export const courseRouter = express.Router();
 courseRouter.use(requireAuth);
 
 // GET /api/v1/courses (Filtered by role: teachers see assigned, students see classroom courses, admins see all)
-courseRouter.get('/', (req: PlatformRequest, res: express.Response) => {
+courseRouter.get('/', async (req: PlatformRequest, res: express.Response) => {
   try {
     const { role, id: userId, classroomId } = req.user!;
-    let courses = db.getCourses(req.organization!.id);
+    let courses = await db.getCoursesAsync(req.organization!.id);
 
     if (role === 'TEACHER') {
       courses = courses.filter((c) => c.teacherId === userId);
@@ -26,9 +26,9 @@ courseRouter.get('/', (req: PlatformRequest, res: express.Response) => {
 });
 
 // GET /api/v1/courses/:id
-courseRouter.get('/:id', (req: PlatformRequest, res: express.Response) => {
+courseRouter.get('/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const course = db.getCourseById(req.params.id, req.organization!.id);
+    const course = await db.getCourseByIdAsync(req.params.id, req.organization!.id);
     if (!course) return res.status(404).json({ success: false, error: 'COURSE_NOT_FOUND', message: 'المقرر غير موجود' });
 
     // Role-based access check
@@ -39,10 +39,24 @@ courseRouter.get('/:id', (req: PlatformRequest, res: express.Response) => {
       return res.status(403).json({ success: false, error: 'FORBIDDEN', message: 'هذا المقرر ليس مسنداً إليك' });
     }
 
-    const lessons = db.getLessonsByCourse(course.id, req.organization!.id);
+    const [lessons, assignments, students, teacherAssignments] = await Promise.all([
+      db.getLessonsByCourseAsync(course.id, req.organization!.id),
+      db.getAssignmentsByCourseAsync(course.id, req.organization!.id),
+      db.getCourseStudentsAsync(course.id, course.classroomId, req.organization!.id),
+      db.getTeacherAssignmentsByCourseAsync(course.id, req.organization!.id),
+    ]);
     const filteredLessons = req.user!.role === 'STUDENT' ? lessons.filter((l) => l.isPublished) : lessons;
-    const assignments = db.getAssignmentsByCourse(course.id, req.organization!.id);
-    const students = db.getUsersByOrg(req.organization!.id, 'STUDENT').filter((s) => s.classroomId === course.classroomId);
+    const teachers = [
+      ...(course.teacherId
+        ? [{ id: course.teacherId, fullName: course.teacherName, email: undefined, role: 'PRIMARY_TEACHER' }]
+        : []),
+      ...teacherAssignments.map((assignment) => ({
+        id: assignment.teacherId,
+        fullName: assignment.teacherName,
+        email: assignment.teacherEmail,
+        role: assignment.role,
+      })),
+    ].filter((teacher, index, all) => all.findIndex((item) => item.id === teacher.id) === index);
 
     res.json({
       success: true,
@@ -50,6 +64,8 @@ courseRouter.get('/:id', (req: PlatformRequest, res: express.Response) => {
         ...course,
         lessons: filteredLessons,
         assignments,
+        teacherAssignments,
+        teachers,
         studentsCount: students.length,
         students: students.map((s) => ({ id: s.id, fullName: s.fullName, studentIdNumber: s.studentIdNumber, email: s.email })),
       },
@@ -60,7 +76,7 @@ courseRouter.get('/:id', (req: PlatformRequest, res: express.Response) => {
 });
 
 // POST /api/v1/courses (Admins & Teachers can create)
-courseRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), (req: PlatformRequest, res: express.Response) => {
+courseRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { subjectId, termId, classroomId, title, description, teacherId } = req.body;
     if (!subjectId || !termId || !classroomId || !title) {
@@ -70,20 +86,20 @@ courseRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), (r
     const orgId = req.organization!.id;
 
     // Validate foreign keys in same tenant
-    if (!db.isSubjectInOrg(subjectId, orgId)) {
+    if (!(await db.getSubjectByIdAsync(subjectId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_SUBJECT', message: 'المادة غير صالحة' });
     }
-    if (!db.isTermInOrg(termId, orgId)) {
+    if (!(await db.getTermByIdAsync(termId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_TERM', message: 'الفصل الدراسي غير صالح' });
     }
-    if (!db.isClassroomInOrg(classroomId, orgId)) {
+    if (!(await db.getClassroomByIdAsync(classroomId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة الدراسية غير صالحة' });
     }
 
     let assignedTeacherId = req.user!.id;
     if (req.user!.role === 'ORG_ADMIN' || req.user!.role === 'SUPER_ADMIN') {
       if (teacherId) {
-        const t = db.getUserById(teacherId, orgId);
+        const t = await db.getUserByIdAsync(teacherId, orgId);
         if (!t || (t.role !== 'TEACHER' && t.role !== 'ORG_ADMIN')) {
           return res.status(400).json({ success: false, error: 'INVALID_TEACHER', message: 'المعلم المحدد غير موجود' });
         }
@@ -91,7 +107,7 @@ courseRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), (r
       }
     }
 
-    const course = db.createCourse({
+    const course = await db.createCourseAsync({
       organizationId: orgId,
       subjectId,
       termId,
@@ -108,10 +124,10 @@ courseRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), (r
 });
 
 // PUT /api/v1/courses/:id (Admins or assigned teacher)
-courseRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), (req: PlatformRequest, res: express.Response) => {
+courseRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const orgId = req.organization!.id;
-    const course = db.getCourseById(req.params.id, orgId);
+    const course = await db.getCourseByIdAsync(req.params.id, orgId);
     if (!course) {
       return res.status(404).json({ success: false, error: 'COURSE_NOT_FOUND', message: 'المقرر غير موجود' });
     }
@@ -122,26 +138,26 @@ courseRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), 
 
     const { title, description, subjectId, classroomId, termId, teacherId } = req.body;
 
-    if (subjectId && !db.isSubjectInOrg(subjectId, orgId)) {
+    if (subjectId && !(await db.getSubjectByIdAsync(subjectId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_SUBJECT', message: 'المادة غير صالحة' });
     }
-    if (termId && !db.isTermInOrg(termId, orgId)) {
+    if (termId && !(await db.getTermByIdAsync(termId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_TERM', message: 'الفصل الدراسي غير صالح' });
     }
-    if (classroomId && !db.isClassroomInOrg(classroomId, orgId)) {
+    if (classroomId && !(await db.getClassroomByIdAsync(classroomId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة الدراسية غير صالحة' });
     }
 
     let finalTeacherId = course.teacherId;
     if ((req.user!.role === 'ORG_ADMIN' || req.user!.role === 'SUPER_ADMIN') && teacherId) {
-      const t = db.getUserById(teacherId, orgId);
+      const t = await db.getUserByIdAsync(teacherId, orgId);
       if (!t) {
         return res.status(400).json({ success: false, error: 'INVALID_TEACHER', message: 'المعلم المحدد غير صالح' });
       }
       finalTeacherId = t.id;
     }
 
-    const updated = db.updateCourse(req.params.id, orgId, {
+    const updated = await db.updateCourseAsync(req.params.id, orgId, {
       title: title ? String(title).trim() : undefined,
       description: description !== undefined ? String(description).trim() : undefined,
       subjectId,
@@ -157,15 +173,15 @@ courseRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN', 'TEACHER']), 
 });
 
 // DELETE /api/v1/courses/:id (Admins only)
-courseRouter.delete('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+courseRouter.delete('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const orgId = req.organization!.id;
-    const course = db.getCourseById(req.params.id, orgId);
+    const course = await db.getCourseByIdAsync(req.params.id, orgId);
     if (!course) {
       return res.status(404).json({ success: false, error: 'COURSE_NOT_FOUND', message: 'المقرر غير موجود' });
     }
 
-    const success = db.deleteCourse(req.params.id, orgId);
+    const success = await db.deleteCourseAsync(req.params.id, orgId);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'فشل حذف المقرر' });
     }

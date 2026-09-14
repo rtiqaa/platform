@@ -838,11 +838,9 @@ CREATE POLICY tenant_isolation_org_memberships ON organization_memberships
     USING (
         organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')
         OR user_id = NULLIF(current_setting('app.current_user_id', true), '')
-        OR NULLIF(current_setting('app.current_tenant_id', true), '') IS NULL
     )
     WITH CHECK (
         organization_id = NULLIF(current_setting('app.current_tenant_id', true), '')
-        OR NULLIF(current_setting('app.current_tenant_id', true), '') IS NULL
     );
 
 -- 20. Teacher Assignments Policy
@@ -993,6 +991,42 @@ DROP POLICY IF EXISTS tenant_isolation_parent_link_tokens ON parent_link_tokens;
 CREATE POLICY tenant_isolation_parent_link_tokens ON parent_link_tokens
     USING (organization_id = NULLIF(current_setting('app.current_tenant_id', true), ''))
     WITH CHECK (organization_id = NULLIF(current_setting('app.current_tenant_id', true), ''));
+
+-- Force RLS for the application role as well as table owners.
+ALTER TABLE organizations FORCE ROW LEVEL SECURITY;
+ALTER TABLE academic_years FORCE ROW LEVEL SECURITY;
+ALTER TABLE terms FORCE ROW LEVEL SECURITY;
+ALTER TABLE grade_levels FORCE ROW LEVEL SECURITY;
+ALTER TABLE classrooms FORCE ROW LEVEL SECURITY;
+ALTER TABLE users FORCE ROW LEVEL SECURITY;
+ALTER TABLE organization_memberships FORCE ROW LEVEL SECURITY;
+ALTER TABLE subjects FORCE ROW LEVEL SECURITY;
+ALTER TABLE courses FORCE ROW LEVEL SECURITY;
+ALTER TABLE teacher_assignments FORCE ROW LEVEL SECURITY;
+ALTER TABLE student_enrollments FORCE ROW LEVEL SECURITY;
+ALTER TABLE parent_student_links FORCE ROW LEVEL SECURITY;
+ALTER TABLE student_records FORCE ROW LEVEL SECURITY;
+ALTER TABLE student_behavior_records FORCE ROW LEVEL SECURITY;
+ALTER TABLE student_lifecycle_events FORCE ROW LEVEL SECURITY;
+ALTER TABLE lessons FORCE ROW LEVEL SECURITY;
+ALTER TABLE assignments FORCE ROW LEVEL SECURITY;
+ALTER TABLE submissions FORCE ROW LEVEL SECURITY;
+ALTER TABLE attendance_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE attendance_records FORCE ROW LEVEL SECURITY;
+ALTER TABLE assessments FORCE ROW LEVEL SECURITY;
+ALTER TABLE assessment_grades FORCE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
+ALTER TABLE invitations FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai_conversations FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai_messages FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai_usage FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai_document_chunks FORCE ROW LEVEL SECURITY;
+ALTER TABLE storage_objects FORCE ROW LEVEL SECURITY;
+ALTER TABLE curriculum_units FORCE ROW LEVEL SECURITY;
+ALTER TABLE library_resources FORCE ROW LEVEL SECURITY;
+ALTER TABLE resource_activities FORCE ROW LEVEL SECURITY;
+ALTER TABLE student_profiles FORCE ROW LEVEL SECURITY;
+ALTER TABLE parent_link_tokens FORCE ROW LEVEL SECURITY;
 
 
 

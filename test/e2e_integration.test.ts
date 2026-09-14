@@ -323,6 +323,18 @@ describe('Rtiqa Platform - E2E Production Integration & Database Lifecycle Suite
       assert.strictEqual(asgData.success, true);
       onboardedAssignmentId = asgData.data.id;
 
+      // Course detail includes all tenant-scoped dependent data.
+      const detailRes = await fetch(`${baseUrl}/api/v1/courses/${onboardedCourseId}`, {
+        headers: { Authorization: `Bearer ${onboardedTeacherToken}` },
+      });
+      assert.strictEqual(detailRes.status, 200);
+      const detailData = await detailRes.json();
+      assert.strictEqual(detailData.success, true);
+      assert.ok(detailData.data.lessons.some((lesson: any) => lesson.id === onboardedLessonId));
+      assert.ok(detailData.data.assignments.some((assignment: any) => assignment.id === onboardedAssignmentId));
+      assert.ok(detailData.data.students.some((student: any) => student.id === onboardedStudentId));
+      assert.ok(detailData.data.teachers.some((teacher: any) => teacher.id === onboardedTeacherId));
+
       // Student views Assignment
       const studentAsgRes = await fetch(`${baseUrl}/api/v1/assignments/${onboardedAssignmentId}`, {
         headers: { Authorization: `Bearer ${onboardedStudentToken}` },
