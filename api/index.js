@@ -324,11 +324,519 @@ var init_db = __esm({
         this.curriculumUnits = /* @__PURE__ */ new Map();
         this.libraryResources = /* @__PURE__ */ new Map();
         this.resourceActivities = /* @__PURE__ */ new Map();
-        this.seedInitialData();
+        if (process.env.NODE_ENV !== "production") {
+          this.seedInitialData();
+        }
       }
       // --- Engine Status Check ---
       async getEngineStatus() {
         return checkPostgresConnection();
+      }
+      mapOrganizationRow(row) {
+        return {
+          id: row.id,
+          slug: row.slug,
+          name: row.name,
+          legalName: row.legal_name || void 0,
+          countryCode: row.country_code,
+          timezone: row.timezone,
+          locale: row.locale === "en" ? "en" : "ar",
+          logoUrl: row.logo_url || void 0,
+          isActive: Boolean(row.is_active),
+          createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+          updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at)
+        };
+      }
+      mapUserRow(row) {
+        return {
+          id: row.id,
+          organizationId: row.organization_id,
+          email: row.email,
+          passwordHash: row.password_hash || void 0,
+          fullName: row.full_name,
+          role: row.role,
+          avatarUrl: row.avatar_url || void 0,
+          phone: row.phone || void 0,
+          studentIdNumber: row.student_id_number || void 0,
+          teacherSpecialization: row.teacher_specialization || void 0,
+          classroomId: row.classroom_id || void 0,
+          emailVerified: Boolean(row.email_verified),
+          phoneVerified: Boolean(row.phone_verified),
+          authProviders: row.auth_providers || ["email"],
+          googleId: row.google_id || void 0,
+          isActive: Boolean(row.is_active),
+          createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+          updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at)
+        };
+      }
+      mapMembershipRow(row, organization) {
+        return {
+          id: row.id,
+          userId: row.user_id,
+          organizationId: row.organization_id,
+          role: row.role,
+          isDefault: Boolean(row.is_default),
+          status: row.status,
+          classroomId: row.classroom_id || void 0,
+          studentIdNumber: row.student_id_number || void 0,
+          teacherSpecialization: row.teacher_specialization || void 0,
+          organizationName: organization?.name,
+          organizationSlug: organization?.slug,
+          joinedAt: row.joined_at?.toISOString ? row.joined_at.toISOString() : String(row.joined_at)
+        };
+      }
+      async getProductionOrganizationIds() {
+        const result = await queryGlobal(
+          "SELECT id FROM organizations WHERE is_active = TRUE ORDER BY id"
+        );
+        return result.rows.map((row) => row.id);
+      }
+      async withIdentityTenant(organizationId, callback) {
+        if (!organizationId) throw new Error("TENANT_REQUIRED");
+        return withTenantClient(organizationId, callback);
+      }
+      async getOrganizationByIdAsync(organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.getOrganizationById(organizationId);
+        const result = await queryGlobal(
+          `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations WHERE id = $1 AND is_active = TRUE`,
+          [organizationId]
+        );
+        return result.rows[0] ? this.mapOrganizationRow(result.rows[0]) : void 0;
+      }
+      async getOrganizationBySlugAsync(slug) {
+        if (process.env.NODE_ENV !== "production") return this.getOrganizationBySlug(slug);
+        const result = await queryGlobal(
+          `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations WHERE (slug = $1 OR id = $1) AND is_active = TRUE`,
+          [slug]
+        );
+        return result.rows[0] ? this.mapOrganizationRow(result.rows[0]) : void 0;
+      }
+      async getUsersByOrgAsync(organizationId, role) {
+        if (process.env.NODE_ENV !== "production") return this.getUsersByOrg(organizationId, role);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                phone, student_id_number, teacher_specialization, classroom_id,
+                email_verified, phone_verified, auth_providers, google_id, is_active,
+                created_at, updated_at
+         FROM users
+         WHERE organization_id = $1 AND ($2::text IS NULL OR role = $2)
+         ORDER BY full_name, id`,
+            [organizationId, role || null]
+          );
+          return result.rows.map((row) => this.mapUserRow(row));
+        });
+      }
+      async isClassroomInOrgAsync(classroomId, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.isClassroomInOrg(classroomId, organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            "SELECT 1 FROM classrooms WHERE id = $1 AND organization_id = $2 LIMIT 1",
+            [classroomId, organizationId]
+          );
+          return result.rowCount === 1;
+        });
+      }
+      async getUserByIdAsync(userId, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.getUserById(userId, organizationId);
+        const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+        for (const currentOrganizationId of organizationIds) {
+          const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE id = $1 AND organization_id = $2`,
+              [userId, currentOrganizationId]
+            );
+            return result.rows[0] ? this.mapUserRow(result.rows[0]) : void 0;
+          });
+          if (user) return user;
+        }
+        return void 0;
+      }
+      async findUserByEmailAsync(email, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.findUserByEmail(email, organizationId);
+        const normalized = email.trim().toLowerCase();
+        const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+        for (const currentOrganizationId of organizationIds) {
+          const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE lower(email) = $1 AND organization_id = $2`,
+              [normalized, currentOrganizationId]
+            );
+            return result.rows[0] ? this.mapUserRow(result.rows[0]) : void 0;
+          });
+          if (user) return user;
+        }
+        return void 0;
+      }
+      async findUserByPhoneAsync(phone, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.findUserByPhone(phone, organizationId);
+        const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+        for (const currentOrganizationId of organizationIds) {
+          const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE phone = $1 AND organization_id = $2`,
+              [phone.trim(), currentOrganizationId]
+            );
+            return result.rows[0] ? this.mapUserRow(result.rows[0]) : void 0;
+          });
+          if (user) return user;
+        }
+        return void 0;
+      }
+      async findUserByGoogleIdAsync(googleId) {
+        if (process.env.NODE_ENV !== "production") return this.findUserByGoogleId(googleId);
+        const organizationIds = await this.getProductionOrganizationIds();
+        for (const organizationId of organizationIds) {
+          const user = await this.withIdentityTenant(organizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE google_id = $1 AND organization_id = $2`,
+              [googleId.trim(), organizationId]
+            );
+            return result.rows[0] ? this.mapUserRow(result.rows[0]) : void 0;
+          });
+          if (user) return user;
+        }
+        return void 0;
+      }
+      async getMembershipsByUserIdAsync(userId) {
+        if (process.env.NODE_ENV !== "production") return this.getMembershipsByUserId(userId);
+        const memberships = [];
+        for (const organizationId of await this.getProductionOrganizationIds()) {
+          const organization = await this.getOrganizationByIdAsync(organizationId);
+          const rows = await this.withIdentityTenant(organizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                  student_id_number, teacher_specialization, joined_at
+           FROM organization_memberships
+           WHERE user_id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+              [userId, organizationId]
+            );
+            return result.rows;
+          });
+          memberships.push(...rows.map((row) => this.mapMembershipRow(row, organization)));
+        }
+        return memberships;
+      }
+      async getMembershipByIdAsync(membershipId) {
+        if (process.env.NODE_ENV !== "production") return this.getMembershipById(membershipId);
+        for (const organizationId of await this.getProductionOrganizationIds()) {
+          const organization = await this.getOrganizationByIdAsync(organizationId);
+          const membership = await this.withIdentityTenant(organizationId, async (client) => {
+            const result = await client.query(
+              `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                  student_id_number, teacher_specialization, joined_at
+           FROM organization_memberships
+           WHERE id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+              [membershipId, organizationId]
+            );
+            return result.rows[0] ? this.mapMembershipRow(result.rows[0], organization) : void 0;
+          });
+          if (membership) return membership;
+        }
+        return void 0;
+      }
+      async getMembershipAsync(userId, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.getMembership(userId, organizationId);
+        const organization = await this.getOrganizationByIdAsync(organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                student_id_number, teacher_specialization, joined_at
+         FROM organization_memberships
+         WHERE user_id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+            [userId, organizationId]
+          );
+          return result.rows[0] ? this.mapMembershipRow(result.rows[0], organization) : void 0;
+        });
+      }
+      async createOrganizationAsync(data) {
+        if (process.env.NODE_ENV !== "production") return this.createOrganization(data);
+        const id = generateId("org");
+        const now = /* @__PURE__ */ new Date();
+        const result = await queryGlobal(
+          `INSERT INTO organizations (
+         id, slug, name, legal_name, country_code, timezone, locale, logo_url, is_active, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+       RETURNING id, slug, name, legal_name, country_code, timezone, locale, logo_url, is_active, created_at, updated_at`,
+          [id, data.slug, data.name, data.legalName || null, data.countryCode, data.timezone, data.locale, data.logoUrl || null, data.isActive, now]
+        );
+        return this.mapOrganizationRow(result.rows[0]);
+      }
+      async createUserAsync(data) {
+        if (process.env.NODE_ENV !== "production") return this.createUser(data);
+        if (!data.organizationId) throw new Error("TENANT_REQUIRED");
+        const id = data.id || generateId("usr");
+        const now = /* @__PURE__ */ new Date();
+        const user = await this.withIdentityTenant(data.organizationId, async (client) => {
+          await client.query("BEGIN");
+          try {
+            const result = await client.query(
+              `INSERT INTO users (
+             id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+             student_id_number, teacher_specialization, classroom_id, email_verified,
+             phone_verified, auth_providers, google_id, is_active, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+           RETURNING id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+                     student_id_number, teacher_specialization, classroom_id, email_verified,
+                     phone_verified, auth_providers, google_id, is_active, created_at, updated_at`,
+              [
+                id,
+                data.organizationId,
+                data.email.trim().toLowerCase(),
+                data.passwordHash || null,
+                data.fullName,
+                data.role,
+                data.avatarUrl || null,
+                data.phone || null,
+                data.studentIdNumber || null,
+                data.teacherSpecialization || null,
+                data.classroomId || null,
+                data.emailVerified ?? false,
+                data.phoneVerified ?? false,
+                JSON.stringify(data.authProviders || ["email"]),
+                data.googleId || null,
+                data.isActive,
+                now
+              ]
+            );
+            const membershipId = generateId("mem");
+            await client.query(
+              `INSERT INTO organization_memberships (
+             id, user_id, organization_id, role, is_default, status, classroom_id,
+             student_id_number, teacher_specialization, joined_at
+           ) VALUES ($1, $2, $3, $4, TRUE, 'ACTIVE', $5, $6, $7, $8)`,
+              [membershipId, id, data.organizationId, data.role, data.classroomId || null, data.studentIdNumber || null, data.teacherSpecialization || null, now]
+            );
+            await client.query("COMMIT");
+            return this.mapUserRow(result.rows[0]);
+          } catch (error) {
+            await client.query("ROLLBACK").catch(() => {
+            });
+            throw error;
+          }
+        });
+        return user;
+      }
+      async updateUserAsync(id, organizationId, updates) {
+        if (process.env.NODE_ENV !== "production") return this.updateUser(id, organizationId, updates);
+        const allowed = [
+          ["email", updates.email?.trim().toLowerCase()],
+          ["password_hash", updates.passwordHash],
+          ["full_name", updates.fullName],
+          ["role", updates.role],
+          ["avatar_url", updates.avatarUrl],
+          ["phone", updates.phone],
+          ["student_id_number", updates.studentIdNumber],
+          ["teacher_specialization", updates.teacherSpecialization],
+          ["classroom_id", updates.classroomId],
+          ["email_verified", updates.emailVerified],
+          ["phone_verified", updates.phoneVerified],
+          ["auth_providers", updates.authProviders ? JSON.stringify(updates.authProviders) : void 0],
+          ["google_id", updates.googleId],
+          ["is_active", updates.isActive]
+        ].filter(([, value]) => value !== void 0);
+        if (allowed.length === 0) return this.getUserByIdAsync(id, organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const setClause = allowed.map(([column], index) => `${column} = $${index + 3}`).join(", ");
+          const values = allowed.map(([, value]) => value);
+          const result = await client.query(
+            `UPDATE users SET ${setClause}, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2
+         RETURNING id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+                   student_id_number, teacher_specialization, classroom_id, email_verified,
+                   phone_verified, auth_providers, google_id, is_active, created_at, updated_at`,
+            [id, organizationId, ...values]
+          );
+          return result.rows[0] ? this.mapUserRow(result.rows[0]) : void 0;
+        });
+      }
+      async unlinkAccountProviderAsync(userId, organizationId, provider) {
+        if (process.env.NODE_ENV !== "production") return this.unlinkAccountProvider(userId, provider);
+        const user = await this.getUserByIdAsync(userId, organizationId);
+        if (!user) return { success: false, error: "USER_NOT_FOUND" };
+        const providers = user.authProviders || ["email"];
+        if (providers.length <= 1) return { success: false, error: "CANNOT_UNLINK_LAST_PROVIDER", user };
+        const updates = {
+          authProviders: providers.filter((current) => current !== provider)
+        };
+        if (provider === "google") updates.googleId = void 0;
+        if (provider === "phone") {
+          updates.phone = void 0;
+          updates.phoneVerified = false;
+        }
+        if (provider === "email") updates.emailVerified = false;
+        const updated = await this.updateUserAsync(userId, organizationId, updates);
+        return { success: true, user: updated };
+      }
+      async deleteUserAsync(id, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.deleteUser(id, organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            "DELETE FROM users WHERE id = $1 AND organization_id = $2 RETURNING id",
+            [id, organizationId]
+          );
+          return result.rowCount === 1;
+        });
+      }
+      async addMembershipAsync(data) {
+        if (process.env.NODE_ENV !== "production") return this.addMembership(data);
+        const id = generateId("mem");
+        return this.withIdentityTenant(data.organizationId, async (client) => {
+          const result = await client.query(
+            `INSERT INTO organization_memberships (
+           id, user_id, organization_id, role, is_default, status, classroom_id,
+           student_id_number, teacher_specialization, joined_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         RETURNING id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at`,
+            [id, data.userId, data.organizationId, data.role, data.isDefault, data.status, data.classroomId || null, data.studentIdNumber || null, data.teacherSpecialization || null]
+          );
+          const organization = await this.getOrganizationByIdAsync(data.organizationId);
+          return this.mapMembershipRow(result.rows[0], organization);
+        });
+      }
+      async updateMembershipAsync(id, organizationId, updates) {
+        if (process.env.NODE_ENV !== "production") return this.updateMembership(id, updates);
+        const allowed = [
+          ["role", updates.role],
+          ["is_default", updates.isDefault],
+          ["status", updates.status],
+          ["classroom_id", updates.classroomId],
+          ["student_id_number", updates.studentIdNumber],
+          ["teacher_specialization", updates.teacherSpecialization]
+        ].filter(([, value]) => value !== void 0);
+        if (allowed.length === 0) return this.getMembershipByIdAsync(id);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const setClause = allowed.map(([column], index) => `${column} = $${index + 3}`).join(", ");
+          const values = allowed.map(([, value]) => value);
+          const result = await client.query(
+            `UPDATE organization_memberships SET ${setClause}
+         WHERE id = $1 AND organization_id = $2
+         RETURNING id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at`,
+            [id, organizationId, ...values]
+          );
+          if (!result.rows[0]) return void 0;
+          const organization = await this.getOrganizationByIdAsync(organizationId);
+          return this.mapMembershipRow(result.rows[0], organization);
+        });
+      }
+      async removeMembershipAsync(id, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.removeMembership(id);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `UPDATE organization_memberships SET status = 'REVOKED'
+         WHERE id = $1 AND organization_id = $2 AND status <> 'REVOKED'
+         RETURNING id`,
+            [id, organizationId]
+          );
+          return result.rowCount === 1;
+        });
+      }
+      /** Loads identity and tenant context from PostgreSQL for the production process. */
+      async initializeFromPostgres() {
+        if (process.env.NODE_ENV !== "production") return;
+        const status = await checkPostgresConnection();
+        if (!status.connected) {
+          throw new Error("POSTGRES_REQUIRED_FOR_PRODUCTION_DATA");
+        }
+        const organizationResult = await queryGlobal(
+          `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations
+       WHERE is_active = TRUE
+       ORDER BY id`
+        );
+        for (const row of organizationResult.rows) {
+          const organization = {
+            id: row.id,
+            slug: row.slug,
+            name: row.name,
+            legalName: row.legal_name || void 0,
+            countryCode: row.country_code,
+            timezone: row.timezone,
+            locale: row.locale === "en" ? "en" : "ar",
+            logoUrl: row.logo_url || void 0,
+            isActive: row.is_active,
+            createdAt: row.created_at.toISOString(),
+            updatedAt: row.updated_at.toISOString()
+          };
+          this.organizations.set(organization.id, organization);
+          await withTenantClient(organization.id, async (client) => {
+            const [usersResult, membershipsResult] = await Promise.all([
+              client.query(`
+            SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                   phone, student_id_number, teacher_specialization, classroom_id,
+                   email_verified, phone_verified, auth_providers, google_id, is_active,
+                   created_at, updated_at
+            FROM users
+            WHERE organization_id = $1 AND is_active = TRUE`, [organization.id]),
+              client.query(`
+            SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at
+            FROM organization_memberships
+            WHERE organization_id = $1 AND status <> 'REVOKED'`, [organization.id])
+            ]);
+            for (const row2 of usersResult.rows) {
+              const user = {
+                id: row2.id,
+                organizationId: row2.organization_id,
+                email: row2.email,
+                passwordHash: row2.password_hash || void 0,
+                fullName: row2.full_name,
+                role: row2.role,
+                avatarUrl: row2.avatar_url || void 0,
+                phone: row2.phone || void 0,
+                studentIdNumber: row2.student_id_number || void 0,
+                teacherSpecialization: row2.teacher_specialization || void 0,
+                classroomId: row2.classroom_id || void 0,
+                emailVerified: row2.email_verified,
+                phoneVerified: row2.phone_verified,
+                authProviders: row2.auth_providers || ["email"],
+                googleId: row2.google_id || void 0,
+                isActive: row2.is_active,
+                createdAt: row2.created_at.toISOString(),
+                updatedAt: row2.updated_at.toISOString()
+              };
+              this.users.set(user.id, user);
+            }
+            for (const row2 of membershipsResult.rows) {
+              const membership = {
+                id: row2.id,
+                userId: row2.user_id,
+                organizationId: row2.organization_id,
+                role: row2.role,
+                isDefault: row2.is_default,
+                status: row2.status,
+                classroomId: row2.classroom_id || void 0,
+                studentIdNumber: row2.student_id_number || void 0,
+                teacherSpecialization: row2.teacher_specialization || void 0,
+                joinedAt: row2.joined_at.toISOString()
+              };
+              this.organizationMemberships.set(membership.id, membership);
+            }
+          });
+        }
       }
       // --- Seed realistic Multi-Tenant Data ---
       seedInitialData() {
@@ -3888,6 +4396,127 @@ var init_db = __esm({
         this.invitations.set(id, inv);
         return true;
       }
+      mapInvitationRow(row) {
+        return {
+          id: row.id,
+          organizationId: row.organization_id,
+          email: row.email,
+          role: row.role,
+          inviteCode: row.invite_code,
+          tokenHash: row.token_hash || void 0,
+          fullName: row.full_name || void 0,
+          classroomId: row.classroom_id || void 0,
+          classroomName: row.classroom_name || void 0,
+          teacherSpecialization: row.teacher_specialization || void 0,
+          studentIdNumber: row.student_id_number || void 0,
+          createdBy: row.created_by || void 0,
+          createdByName: row.created_by_name || void 0,
+          expiresAt: row.expires_at?.toISOString ? row.expires_at.toISOString() : String(row.expires_at),
+          usedAt: row.used_at?.toISOString ? row.used_at.toISOString() : row.used_at || void 0,
+          isUsed: Boolean(row.is_used),
+          createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at)
+        };
+      }
+      invitationSelectSql() {
+        return `
+      SELECT i.id, i.organization_id, i.email, i.role, i.invite_code, i."tokenHash" AS token_hash,
+             i.full_name, i.classroom_id, c.name AS classroom_name, i.teacher_specialization,
+             i.student_id_number, i.created_by, creator.full_name AS created_by_name,
+             i.expires_at, i.used_at, i.is_used, i.created_at
+      FROM invitations i
+      LEFT JOIN classrooms c ON c.id = i.classroom_id AND c.organization_id = i.organization_id
+      LEFT JOIN users creator ON creator.id = i.created_by AND creator.organization_id = i.organization_id`;
+      }
+      async createInvitationAsync(data) {
+        if (process.env.NODE_ENV !== "production") return this.createInvitation(data);
+        const id = generateId("inv");
+        return this.withIdentityTenant(data.organizationId, async (client) => {
+          const result = await client.query(
+            `INSERT INTO invitations (
+           id, organization_id, email, role, invite_code, "tokenHash", full_name,
+           classroom_id, teacher_specialization, student_id_number, created_by,
+           expires_at, is_used, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, FALSE, CURRENT_TIMESTAMP)
+         RETURNING id, organization_id, email, role, invite_code, "tokenHash", full_name,
+                   classroom_id, teacher_specialization, student_id_number, created_by,
+                   expires_at, used_at, is_used, created_at`,
+            [id, data.organizationId, data.email.trim().toLowerCase(), data.role, data.inviteCode.toUpperCase(), data.tokenHash || null, data.fullName || null, data.classroomId || null, data.teacherSpecialization || null, data.studentIdNumber || null, data.createdBy || null, data.expiresAt]
+          );
+          const invitation = this.mapInvitationRow(result.rows[0]);
+          const classroom = data.classroomId ? await client.query("SELECT name FROM classrooms WHERE id = $1 AND organization_id = $2", [data.classroomId, data.organizationId]) : void 0;
+          invitation.classroomName = classroom?.rows[0]?.name;
+          return invitation;
+        });
+      }
+      async getInvitationByCodeAsync(code) {
+        if (process.env.NODE_ENV !== "production") return this.getInvitationByCode(code);
+        const normalized = code.trim().toUpperCase();
+        for (const organizationId of await this.getProductionOrganizationIds()) {
+          const invitation = await this.withIdentityTenant(organizationId, async (client) => {
+            const result = await client.query(
+              `${this.invitationSelectSql()} WHERE i.organization_id = $1 AND upper(i.invite_code) = $2`,
+              [organizationId, normalized]
+            );
+            return result.rows[0] ? this.mapInvitationRow(result.rows[0]) : void 0;
+          });
+          if (invitation) return invitation;
+        }
+        return void 0;
+      }
+      async getPendingInvitationsByEmailAsync(email) {
+        if (process.env.NODE_ENV !== "production") return this.getPendingInvitationsByEmail(email);
+        const pending = [];
+        for (const organizationId of await this.getProductionOrganizationIds()) {
+          const rows = await this.withIdentityTenant(organizationId, async (client) => {
+            const result = await client.query(
+              `${this.invitationSelectSql()}
+           WHERE i.organization_id = $1 AND lower(i.email) = $2 AND i.is_used = FALSE AND i.used_at IS NULL
+             AND i.expires_at > CURRENT_TIMESTAMP
+           ORDER BY i.created_at DESC`,
+              [organizationId, email.trim().toLowerCase()]
+            );
+            return result.rows;
+          });
+          pending.push(...rows.map((row) => this.mapInvitationRow(row)));
+        }
+        return pending.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      }
+      async getInvitationsByOrgAsync(organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.getInvitationsByOrg(organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `${this.invitationSelectSql()} WHERE i.organization_id = $1 ORDER BY i.created_at DESC`,
+            [organizationId]
+          );
+          return result.rows.map((row) => this.mapInvitationRow(row));
+        });
+      }
+      async revokeInvitationAsync(id, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.revokeInvitation(id, organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `UPDATE invitations SET is_used = TRUE, used_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2 AND is_used = FALSE AND used_at IS NULL
+           AND expires_at > CURRENT_TIMESTAMP
+         RETURNING id`,
+            [id, organizationId]
+          );
+          return result.rowCount === 1;
+        });
+      }
+      async markInvitationUsedAsync(id, organizationId) {
+        if (process.env.NODE_ENV !== "production") return this.markInvitationUsed(id, organizationId);
+        return this.withIdentityTenant(organizationId, async (client) => {
+          const result = await client.query(
+            `UPDATE invitations SET is_used = TRUE, used_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2 AND is_used = FALSE AND used_at IS NULL
+           AND expires_at > CURRENT_TIMESTAMP
+         RETURNING id`,
+            [id, organizationId]
+          );
+          return result.rowCount === 1;
+        });
+      }
       // ==========================================
       // Rtiqa AI Engine Database Methods (Multi-Tenant)
       // ==========================================
@@ -4175,6 +4804,10 @@ var init_db = __esm({
       }
       // Reset database state (useful for automated tests)
       resetData() {
+        const isTestProcess = process.argv.some((arg) => arg.includes("--test") || arg.includes("/test/"));
+        if (process.env.NODE_ENV === "production" && !isTestProcess) {
+          throw new Error("RESET_DATA_DISABLED_IN_PRODUCTION");
+        }
         this.organizations.clear();
         this.users.clear();
         this.academicYears.clear();
@@ -5076,8 +5709,9 @@ import fs from "fs";
 import path from "path";
 import pg2 from "pg";
 async function runMigrations() {
-  const runMigrationsFlag = process.env.RUN_MIGRATIONS === "true";
-  const directUrl = process.env.DIRECT_DATABASE_URL;
+  const isProduction = process.env.NODE_ENV === "production";
+  const runMigrationsFlag = isProduction || process.env.RUN_MIGRATIONS === "true";
+  const directUrl = process.env.DIRECT_DATABASE_URL || (!isProduction ? process.env.DATABASE_URL : void 0);
   if (!runMigrationsFlag) {
     return {
       success: true,
@@ -5087,7 +5721,7 @@ async function runMigrations() {
   if (!directUrl) {
     return {
       success: false,
-      message: `Cannot run migrations: RUN_MIGRATIONS is true but DIRECT_DATABASE_URL is missing. Migrations require a direct database connection.`
+      message: `Cannot run migrations: production startup requires DIRECT_DATABASE_URL. RUN_MIGRATIONS=true outside production may use DATABASE_URL. Migrations require a direct database connection.`
     };
   }
   const client = new pg2.Client({
@@ -5251,7 +5885,6 @@ var init_migrate = __esm({
 // server.ts
 import express16 from "express";
 import path2 from "path";
-import { fileURLToPath } from "url";
 
 // server/platform/index.ts
 import express15 from "express";
@@ -5335,13 +5968,20 @@ function decodeAndVerifyToken(token) {
   }
 }
 var platformAuthMiddleware = (req, res, next) => {
+  void resolvePlatformAuth(req, res, next).catch(next);
+};
+var resolvePlatformAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   const tenantHeader = req.headers["x-tenant-id"] || req.headers["x-tenant-slug"];
+  if (process.env.NODE_ENV === "production" && !authHeader) {
+    next();
+    return;
+  }
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7).trim();
     const verified = decodeAndVerifyToken(token);
     if (verified) {
-      const baseUser = db.getUserById(verified.uid);
+      const baseUser = await db.getUserByIdAsync(verified.uid);
       if (baseUser && baseUser.isActive) {
         if (verified.ctx === "PERSONAL" || !verified.oid && !verified.mid) {
           const userRole = baseUser.role || "GUEST";
@@ -5360,19 +6000,19 @@ var platformAuthMiddleware = (req, res, next) => {
         }
         let activeMembership;
         if (verified.mid) {
-          const m = db.getMembershipById(verified.mid);
+          const m = await db.getMembershipByIdAsync(verified.mid);
           if (m && m.userId === baseUser.id && m.status === "ACTIVE") {
             activeMembership = m;
           }
         }
         if (!activeMembership && verified.oid) {
-          const m = db.getMembership(baseUser.id, verified.oid);
+          const m = await db.getMembershipAsync(baseUser.id, verified.oid);
           if (m && m.status === "ACTIVE") {
             activeMembership = m;
           }
         }
         if (activeMembership) {
-          const org = db.getOrganizationById(activeMembership.organizationId);
+          const org = await db.getOrganizationByIdAsync(activeMembership.organizationId);
           if (org && org.isActive) {
             req.organization = org;
             req.membership = activeMembership;
@@ -5398,7 +6038,7 @@ var platformAuthMiddleware = (req, res, next) => {
           }
         }
         if (baseUser.role === "SUPER_ADMIN" && verified.oid) {
-          const org = db.getOrganizationById(verified.oid);
+          const org = await db.getOrganizationByIdAsync(verified.oid);
           if (org && org.isActive) {
             req.organization = org;
             req.user = {
@@ -5432,13 +6072,13 @@ var platformAuthMiddleware = (req, res, next) => {
     }
   }
   if (tenantHeader) {
-    const org = db.getOrganizationById(tenantHeader) || db.getOrganizationBySlug(tenantHeader);
+    const org = await db.getOrganizationByIdAsync(tenantHeader) || await db.getOrganizationBySlugAsync(tenantHeader);
     if (org) {
       req.organization = org;
     }
   }
   if (!req.organization) {
-    req.organization = db.getOrganizationBySlug("horizon");
+    req.organization = await db.getOrganizationBySlugAsync("horizon");
   }
   next();
 };
@@ -6042,6 +6682,27 @@ function formatUserResponse(user) {
     createdAt: user.createdAt
   };
 }
+async function formatUserResponseAsync(user) {
+  const memberships = await db.getMembershipsByUserIdAsync(user.id);
+  return {
+    id: user.id,
+    organizationId: user.organizationId,
+    email: user.email,
+    phone: user.phone,
+    fullName: user.fullName,
+    role: user.role,
+    avatarUrl: user.avatarUrl,
+    emailVerified: user.emailVerified ?? false,
+    phoneVerified: user.phoneVerified ?? false,
+    authProviders: user.authProviders || ["email"],
+    googleId: user.googleId,
+    classroomId: user.classroomId,
+    studentIdNumber: user.studentIdNumber,
+    teacherSpecialization: user.teacherSpecialization,
+    memberships,
+    createdAt: user.createdAt
+  };
+}
 function isSuperAdminEmail(email) {
   if (!email || typeof email !== "string") return false;
   const configuredAdmins = (process.env.SUPER_ADMIN_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
@@ -6072,7 +6733,35 @@ function generateLoginContext(user) {
   }
   return { token, activeMembership, org, requiresOnboarding };
 }
-authRouter.post("/login", loginLimiter, (req, res) => {
+async function generateLoginContextAsync(user) {
+  const memberships = await db.getMembershipsByUserIdAsync(user.id);
+  const isSuperAdmin = user.role === "SUPER_ADMIN";
+  const requiresOnboarding = !isSuperAdmin && memberships.length === 0;
+  if (isSuperAdmin) {
+    return {
+      token: generateToken(user, void 0, "SUPER_ADMIN", void 0, "PERSONAL"),
+      activeMembership: void 0,
+      org: void 0,
+      requiresOnboarding
+    };
+  }
+  const activeMembership = memberships.find((m) => m.isDefault && m.status === "ACTIVE") || memberships.find((m) => m.status === "ACTIVE") || memberships[0];
+  if (!activeMembership) {
+    return {
+      token: generateToken(user, void 0, user.role, void 0, "PERSONAL"),
+      activeMembership: void 0,
+      org: void 0,
+      requiresOnboarding
+    };
+  }
+  return {
+    token: generateToken(user, activeMembership.organizationId, activeMembership.role, activeMembership.id, "ORGANIZATION"),
+    activeMembership,
+    org: await db.getOrganizationByIdAsync(activeMembership.organizationId),
+    requiresOnboarding
+  };
+}
+authRouter.post("/login", loginLimiter, async (req, res) => {
   try {
     const { email, identifier, phone, password, tenantSlug } = req.body;
     const loginIdentifier = sanitizeString(identifier || email || phone);
@@ -6085,18 +6774,18 @@ authRouter.post("/login", loginLimiter, (req, res) => {
     }
     let orgId = void 0;
     if (tenantSlug) {
-      const org2 = db.getOrganizationBySlug(sanitizeString(tenantSlug));
+      const org2 = await db.getOrganizationBySlugAsync(sanitizeString(tenantSlug));
       if (org2) orgId = org2.id;
     }
     let user = void 0;
     if (isValidEmail(loginIdentifier)) {
-      user = db.findUserByEmail(loginIdentifier.toLowerCase(), orgId);
+      user = await db.findUserByEmailAsync(loginIdentifier.toLowerCase(), orgId);
     } else {
       const phoneNorm = normalizePhoneNumber(loginIdentifier);
       if (phoneNorm.isValid) {
-        user = db.findUserByPhone(phoneNorm.e164, orgId);
+        user = await db.findUserByPhoneAsync(phoneNorm.e164, orgId);
       } else {
-        user = db.findUserByEmail(loginIdentifier.toLowerCase(), orgId);
+        user = await db.findUserByEmailAsync(loginIdentifier.toLowerCase(), orgId);
       }
     }
     if (!user || !user.isActive) {
@@ -6117,17 +6806,17 @@ authRouter.post("/login", loginLimiter, (req, res) => {
       }
     }
     if (isSuperAdminEmail(user.email) && user.role !== "SUPER_ADMIN") {
-      const updatedUser = db.updateUser(user.id, void 0, { role: "SUPER_ADMIN" });
+      const updatedUser = await db.updateUserAsync(user.id, user.organizationId, { role: "SUPER_ADMIN" });
       if (updatedUser) {
         user = updatedUser;
       }
     }
-    const { token, org, requiresOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding } = await generateLoginContextAsync(user);
     db.logAction(org?.id || "platform", user.id, user.email, "LOGIN", "User", user.id, {}, req.ip);
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org,
       requiresOnboarding
     });
@@ -6135,7 +6824,7 @@ authRouter.post("/login", loginLimiter, (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/register", registerLimiter, (req, res) => {
+authRouter.post("/register", registerLimiter, async (req, res) => {
   try {
     const { fullName, email, phone, password, role = "STUDENT", tenantSlug } = req.body;
     if (!fullName || !email && !phone) {
@@ -6177,13 +6866,16 @@ authRouter.post("/register", registerLimiter, (req, res) => {
       cleanPhone = phoneNorm.e164;
     }
     const targetSlug = sanitizeString(tenantSlug) || "horizon";
-    let org = db.getOrganizationBySlug(targetSlug);
+    let org = await db.getOrganizationBySlugAsync(targetSlug);
     if (!org) {
-      org = db.getOrganizationBySlug("horizon") || db.getAllOrganizations()[0];
+      org = await db.getOrganizationBySlugAsync("horizon");
+    }
+    if (!org) {
+      return res.status(503).json({ success: false, error: "ORGANIZATION_STORE_UNAVAILABLE" });
     }
     const orgId = org ? org.id : "org_horizon_001";
     if (cleanEmail) {
-      const existingEmail = db.findUserByEmail(cleanEmail);
+      const existingEmail = await db.findUserByEmailAsync(cleanEmail, orgId);
       if (existingEmail) {
         return res.status(400).json({
           success: false,
@@ -6193,7 +6885,7 @@ authRouter.post("/register", registerLimiter, (req, res) => {
       }
     }
     if (cleanPhone) {
-      const existingPhone = db.findUserByPhone(cleanPhone);
+      const existingPhone = await db.findUserByPhoneAsync(cleanPhone, orgId);
       if (existingPhone) {
         return res.status(400).json({
           success: false,
@@ -6219,7 +6911,7 @@ authRouter.post("/register", registerLimiter, (req, res) => {
     if (cleanPhone) providers.push("phone");
     const validRoles = ["STUDENT", "TEACHER", "PARENT", "ORG_ADMIN"];
     const chosenRole = validRoles.includes(role) ? role : "STUDENT";
-    const newUser = db.createUser({
+    const newUser = await db.createUserAsync({
       organizationId: orgId,
       email: cleanEmail || `user_${Date.now()}@rtiqa.local`,
       phone: cleanPhone || void 0,
@@ -6231,7 +6923,7 @@ authRouter.post("/register", registerLimiter, (req, res) => {
       authProviders: providers.length > 0 ? providers : ["email"],
       isActive: true
     });
-    const { token, org: generatedOrg, requiresOnboarding } = generateLoginContext(newUser);
+    const { token, org: generatedOrg, requiresOnboarding } = await generateLoginContextAsync(newUser);
     let verificationSent = false;
     if (cleanEmail) {
       const rawToken = generateSecureToken(24);
@@ -6243,7 +6935,7 @@ authRouter.post("/register", registerLimiter, (req, res) => {
     return res.status(201).json({
       success: true,
       token,
-      user: formatUserResponse(newUser),
+      user: await formatUserResponseAsync(newUser),
       organization: generatedOrg || org,
       requiresOnboarding,
       verificationSent,
@@ -6280,7 +6972,7 @@ authRouter.post("/phone/otp/send", otpLimiter, async (req, res) => {
     }
     const otp = generateOtp(6);
     const otpHash = hashOtp(otp);
-    const existingUser = db.findUserByPhone(phoneNorm.e164);
+    const existingUser = await db.findUserByPhoneAsync(phoneNorm.e164);
     db.createPhoneOtp(phoneNorm.e164, otpHash, existingUser?.id, 10);
     const smsProvider = getActiveSmsProvider();
     const smsResult = await smsProvider.sendOtp(phoneNorm.e164, otp, purpose);
@@ -6299,7 +6991,7 @@ authRouter.post("/phone/otp/send", otpLimiter, async (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/phone/otp/verify", loginLimiter, (req, res) => {
+authRouter.post("/phone/otp/verify", loginLimiter, async (req, res) => {
   try {
     const { phone, code, fullName, tenantSlug } = req.body;
     const phoneNorm = normalizePhoneNumber(phone);
@@ -6344,13 +7036,16 @@ authRouter.post("/phone/otp/verify", loginLimiter, (req, res) => {
       });
     }
     db.markPhoneOtpUsed(activeOtp.id);
-    let user = db.findUserByPhone(phoneNorm.e164);
+    let user = await db.findUserByPhoneAsync(phoneNorm.e164);
     if (!user) {
       const targetSlug = sanitizeString(tenantSlug) || "horizon";
-      const org2 = db.getOrganizationBySlug(targetSlug) || db.getAllOrganizations()[0];
+      const org2 = await db.getOrganizationBySlugAsync(targetSlug);
+      if (!org2) {
+        return res.status(503).json({ success: false, error: "ORGANIZATION_STORE_UNAVAILABLE" });
+      }
       const orgId = org2 ? org2.id : "org_horizon_001";
       const userName = fullName ? sanitizeString(fullName) : `\u0645\u0633\u062A\u062E\u062F\u0645 ${phoneNorm.e164.slice(-4)}`;
-      user = db.createUser({
+      user = await db.createUserAsync({
         organizationId: orgId,
         email: `phone_${phoneNorm.e164.replace(/[^0-9]/g, "")}@rtiqa.local`,
         phone: phoneNorm.e164,
@@ -6361,15 +7056,20 @@ authRouter.post("/phone/otp/verify", loginLimiter, (req, res) => {
         isActive: true
       });
     } else {
-      db.linkAccountProvider(user.id, "phone", { phone: phoneNorm.e164 });
-      user = db.getUserById(user.id);
+      if (user.organizationId) {
+        user = await db.updateUserAsync(user.id, user.organizationId, {
+          phone: phoneNorm.e164,
+          phoneVerified: true,
+          authProviders: Array.from(/* @__PURE__ */ new Set([...user.authProviders || [], "phone"]))
+        }) || user;
+      }
     }
-    const { token, org, requiresOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding } = await generateLoginContextAsync(user);
     db.logAction(org?.id || "platform", user.id, user.email, "LOGIN_PHONE_OTP", "User", user.id, { phone: phoneNorm.e164 }, req.ip);
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org,
       requiresOnboarding,
       message: "\u062A\u0645 \u0627\u0644\u062A\u062D\u0642\u0642 \u0648\u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062F\u062E\u0648\u0644 \u0628\u0646\u062C\u0627\u062D"
@@ -6436,31 +7136,29 @@ var handleGoogleCallback = async (req, res) => {
     }
     const { profile } = exchange;
     const emailNorm = profile.email.toLowerCase().trim();
-    let user = db.findUserByGoogleId(profile.sub) || db.findUserByEmail(emailNorm);
+    let user = await db.findUserByGoogleIdAsync(profile.sub) || await db.findUserByEmailAsync(emailNorm);
     if (user) {
-      db.linkAccountProvider(user.id, "google", {
+      const providerUpdates = {
+        authProviders: Array.from(/* @__PURE__ */ new Set([...user.authProviders || [], "google"])),
         googleId: profile.sub,
-        email: emailNorm
-      });
-      if (profile.picture && !user.avatarUrl) {
-        db.updateUser(user.id, void 0, { avatarUrl: profile.picture });
-      }
-      if (profile.email_verified && !user.emailVerified) {
-        db.updateUser(user.id, void 0, { emailVerified: true });
-      }
+        email: emailNorm,
+        ...profile.picture && !user.avatarUrl ? { avatarUrl: profile.picture } : {},
+        ...profile.email_verified && !user.emailVerified ? { emailVerified: true } : {}
+      };
+      user = await db.updateUserAsync(user.id, user.organizationId, providerUpdates) || user;
       if (profile.email_verified && isSuperAdminEmail(emailNorm) && user.role !== "SUPER_ADMIN") {
-        const updatedUser = db.updateUser(user.id, void 0, { role: "SUPER_ADMIN" });
+        const updatedUser = await db.updateUserAsync(user.id, user.organizationId, { role: "SUPER_ADMIN" });
         if (updatedUser) {
           user = updatedUser;
         }
       }
-      user = db.getUserById(user.id);
+      user = await db.getUserByIdAsync(user.id, user.organizationId);
     } else {
-      const pendingInvitations = db.getPendingInvitationsByEmail(emailNorm);
+      const pendingInvitations = await db.getPendingInvitationsByEmailAsync(emailNorm);
       if (pendingInvitations.length > 0) {
         const invitation = pendingInvitations[0];
         const assignedRole = profile.email_verified && isSuperAdminEmail(emailNorm) ? "SUPER_ADMIN" : invitation.role;
-        user = db.createUser({
+        user = await db.createUserAsync({
           organizationId: invitation.organizationId,
           email: emailNorm,
           fullName: invitation.fullName || profile.name || emailNorm.split("@")[0],
@@ -6475,10 +7173,13 @@ var handleGoogleCallback = async (req, res) => {
           googleId: profile.sub,
           isActive: true
         });
-        db.markInvitationUsed(invitation.id, invitation.organizationId);
+        await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
       } else {
         const assignedRole = profile.email_verified && isSuperAdminEmail(emailNorm) ? "SUPER_ADMIN" : "PENDING";
-        user = db.createUser({
+        if (process.env.NODE_ENV === "production") {
+          return res.status(409).json({ success: false, error: "ORGANIZATION_REQUIRED", message: "\u0627\u0646\u0636\u0645 \u0625\u0644\u0649 \u0645\u0624\u0633\u0633\u0629 \u0623\u0648 \u0623\u0646\u0634\u0626 \u0645\u0624\u0633\u0633\u0629 \u0642\u0628\u0644 \u0625\u0643\u0645\u0627\u0644 \u062A\u0633\u062C\u064A\u0644 Google." });
+        }
+        user = await db.createUserAsync({
           email: emailNorm,
           fullName: profile.name || emailNorm.split("@")[0],
           avatarUrl: profile.picture,
@@ -6491,7 +7192,7 @@ var handleGoogleCallback = async (req, res) => {
         });
       }
     }
-    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = await generateLoginContextAsync(user);
     const logOrgId = org?.id || "platform";
     db.logAction(logOrgId, user.id, user.email, "LOGIN_GOOGLE", "User", user.id, {
       googleSub: profile.sub,
@@ -6507,7 +7208,7 @@ var handleGoogleCallback = async (req, res) => {
             const authPayload = {
               type: 'GOOGLE_AUTH_SUCCESS',
               token: ${JSON.stringify(token)},
-              user: ${JSON.stringify(formatUserResponse(user))},
+              user: ${JSON.stringify(await formatUserResponseAsync(user))},
               organization: ${JSON.stringify(org || null)},
               status: ${JSON.stringify(isNewUserPendingOnboarding ? "PENDING_ONBOARDING" : "AUTHENTICATED")},
               requiresOnboarding: ${isNewUserPendingOnboarding}
@@ -6530,7 +7231,7 @@ var handleGoogleCallback = async (req, res) => {
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org || null,
       status: isNewUserPendingOnboarding ? "PENDING_ONBOARDING" : "AUTHENTICATED",
       requiresOnboarding: isNewUserPendingOnboarding,
@@ -6558,31 +7259,29 @@ authRouter.post("/google/verify-credential", loginLimiter, async (req, res) => {
     }
     const { profile } = verify;
     const emailNorm = profile.email.toLowerCase().trim();
-    let user = db.findUserByGoogleId(profile.sub) || db.findUserByEmail(emailNorm);
+    let user = await db.findUserByGoogleIdAsync(profile.sub) || await db.findUserByEmailAsync(emailNorm);
     if (user) {
-      db.linkAccountProvider(user.id, "google", {
+      const providerUpdates = {
+        authProviders: Array.from(/* @__PURE__ */ new Set([...user.authProviders || [], "google"])),
         googleId: profile.sub,
-        email: emailNorm
-      });
-      if (profile.picture && !user.avatarUrl) {
-        db.updateUser(user.id, void 0, { avatarUrl: profile.picture });
-      }
-      if (profile.email_verified && !user.emailVerified) {
-        db.updateUser(user.id, void 0, { emailVerified: true });
-      }
+        email: emailNorm,
+        ...profile.picture && !user.avatarUrl ? { avatarUrl: profile.picture } : {},
+        ...profile.email_verified && !user.emailVerified ? { emailVerified: true } : {}
+      };
+      user = await db.updateUserAsync(user.id, user.organizationId, providerUpdates) || user;
       if (profile.email_verified && isSuperAdminEmail(emailNorm) && user.role !== "SUPER_ADMIN") {
-        const updatedUser = db.updateUser(user.id, void 0, { role: "SUPER_ADMIN" });
+        const updatedUser = await db.updateUserAsync(user.id, user.organizationId, { role: "SUPER_ADMIN" });
         if (updatedUser) {
           user = updatedUser;
         }
       }
-      user = db.getUserById(user.id);
+      user = await db.getUserByIdAsync(user.id, user.organizationId);
     } else {
-      const pendingInvitations = db.getPendingInvitationsByEmail(emailNorm);
+      const pendingInvitations = await db.getPendingInvitationsByEmailAsync(emailNorm);
       if (pendingInvitations.length > 0) {
         const invitation = pendingInvitations[0];
         const assignedRole = profile.email_verified && isSuperAdminEmail(emailNorm) ? "SUPER_ADMIN" : invitation.role;
-        user = db.createUser({
+        user = await db.createUserAsync({
           organizationId: invitation.organizationId,
           email: emailNorm,
           fullName: invitation.fullName || profile.name || emailNorm.split("@")[0],
@@ -6597,10 +7296,13 @@ authRouter.post("/google/verify-credential", loginLimiter, async (req, res) => {
           googleId: profile.sub,
           isActive: true
         });
-        db.markInvitationUsed(invitation.id, invitation.organizationId);
+        await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
       } else {
         const assignedRole = profile.email_verified && isSuperAdminEmail(emailNorm) ? "SUPER_ADMIN" : "PENDING";
-        user = db.createUser({
+        if (process.env.NODE_ENV === "production") {
+          return res.status(409).json({ success: false, error: "ORGANIZATION_REQUIRED", message: "\u0627\u0646\u0636\u0645 \u0625\u0644\u0649 \u0645\u0624\u0633\u0633\u0629 \u0623\u0648 \u0623\u0646\u0634\u0626 \u0645\u0624\u0633\u0633\u0629 \u0642\u0628\u0644 \u0625\u0643\u0645\u0627\u0644 \u062A\u0633\u062C\u064A\u0644 Google." });
+        }
+        user = await db.createUserAsync({
           email: emailNorm,
           fullName: profile.name || emailNorm.split("@")[0],
           avatarUrl: profile.picture,
@@ -6613,7 +7315,7 @@ authRouter.post("/google/verify-credential", loginLimiter, async (req, res) => {
         });
       }
     }
-    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = await generateLoginContextAsync(user);
     const logOrgId = org?.id || "platform";
     db.logAction(logOrgId, user.id, user.email, "LOGIN_GOOGLE_CREDENTIAL", "User", user.id, {
       isPendingOnboarding: isNewUserPendingOnboarding
@@ -6621,7 +7323,7 @@ authRouter.post("/google/verify-credential", loginLimiter, async (req, res) => {
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org || null,
       status: isNewUserPendingOnboarding ? "PENDING_ONBOARDING" : "AUTHENTICATED",
       requiresOnboarding: isNewUserPendingOnboarding,
@@ -6631,7 +7333,7 @@ authRouter.post("/google/verify-credential", loginLimiter, async (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/forgot-password", forgotPasswordLimiter, (req, res) => {
+authRouter.post("/forgot-password", forgotPasswordLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
@@ -6641,14 +7343,14 @@ authRouter.post("/forgot-password", forgotPasswordLimiter, (req, res) => {
     if (!isValidEmail(cleanEmail)) {
       return res.status(400).json({ success: false, error: "INVALID_EMAIL", message: "\u0635\u064A\u063A\u0629 \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629" });
     }
-    const user = db.findUserByEmail(cleanEmail);
+    const user = await db.findUserByEmailAsync(cleanEmail);
     let resetTokenValue = void 0;
     if (user && user.isActive) {
       const rawToken = generateSecureToken(32);
       const tokenHash = hashOtp(rawToken);
       db.createPasswordResetToken(user.id, user.email, tokenHash, 60);
       resetTokenValue = rawToken;
-      const org = user.organizationId ? db.getOrganizationById(user.organizationId) : void 0;
+      const org = user.organizationId ? await db.getOrganizationByIdAsync(user.organizationId) : void 0;
       emailService.sendPasswordResetEmail({
         to: user.email,
         recipientName: user.fullName,
@@ -6669,7 +7371,7 @@ authRouter.post("/forgot-password", forgotPasswordLimiter, (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/reset-password", (req, res) => {
+authRouter.post("/reset-password", async (req, res) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
@@ -6700,12 +7402,15 @@ authRouter.post("/reset-password", (req, res) => {
         message: "\u0631\u0627\u0628\u0637 \u0627\u0633\u062A\u0639\u0627\u062F\u0629 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D \u0623\u0648 \u0645\u0646\u062A\u0647\u064A \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629"
       });
     }
-    const user = db.getUserById(resetRecord.userId);
+    const user = await db.getUserByIdAsync(resetRecord.userId);
     if (!user) {
       return res.status(404).json({ success: false, error: "USER_NOT_FOUND" });
     }
     const newHash = hashPassword(newPassword);
-    db.updateUser(user.id, void 0, { passwordHash: newHash });
+    if (!user.organizationId) {
+      return res.status(409).json({ success: false, error: "ORGANIZATION_REQUIRED" });
+    }
+    await db.updateUserAsync(user.id, user.organizationId, { passwordHash: newHash });
     db.markPasswordResetTokenUsed(resetRecord.id);
     db.logAction(user.organizationId, user.id, user.email, "RESET_PASSWORD", "User", user.id, {}, req.ip);
     return res.json({
@@ -6716,7 +7421,7 @@ authRouter.post("/reset-password", (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/change-password", requireAuth, (req, res) => {
+authRouter.post("/change-password", requireAuth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     const user = req.user;
@@ -6736,12 +7441,12 @@ authRouter.post("/change-password", requireAuth, (req, res) => {
       return res.status(400).json({ success: false, error: "WEAK_PASSWORD", message: pStrength.message });
     }
     const newHash = hashPassword(newPassword);
-    const updated = db.updateUser(user.id, void 0, { passwordHash: newHash });
+    const updated = user.organizationId ? await db.updateUserAsync(user.id, user.organizationId, { passwordHash: newHash }) : void 0;
     db.logAction(user.organizationId, user.id, user.email, "CHANGE_PASSWORD", "User", user.id, {}, req.ip);
     return res.json({
       success: true,
       message: "\u062A\u0645 \u062A\u063A\u064A\u064A\u0631 \u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u0628\u0646\u062C\u0627\u062D",
-      user: updated ? formatUserResponse(updated) : void 0
+      user: updated ? await formatUserResponseAsync(updated) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
@@ -6767,7 +7472,7 @@ authRouter.post("/verify-email/send", requireAuth, (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/verify-email/confirm", (req, res) => {
+authRouter.post("/verify-email/confirm", async (req, res) => {
   try {
     const { token } = req.body;
     if (!token) {
@@ -6786,12 +7491,13 @@ authRouter.post("/verify-email/confirm", (req, res) => {
         message: "\u0631\u0645\u0632 \u0627\u0644\u062A\u062D\u0642\u0642 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D \u0623\u0648 \u0645\u0646\u062A\u0647\u064A \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629"
       });
     }
-    const updated = db.updateUser(match.userId, void 0, { emailVerified: true });
+    const targetUser = await db.getUserByIdAsync(match.userId);
+    const updated = targetUser?.organizationId ? await db.updateUserAsync(match.userId, targetUser.organizationId, { emailVerified: true }) : void 0;
     db.markEmailVerificationTokenUsed(match.id);
     return res.json({
       success: true,
       message: "\u062A\u0645 \u062A\u0648\u062B\u064A\u0642 \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0628\u0646\u062C\u0627\u062D",
-      user: updated ? formatUserResponse(updated) : void 0
+      user: updated ? await formatUserResponseAsync(updated) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
@@ -6823,7 +7529,7 @@ authRouter.post("/link/google", requireAuth, async (req, res) => {
     } else {
       return res.status(400).json({ success: false, error: "CREDENTIAL_OR_CODE_REQUIRED" });
     }
-    const existingGoogle = db.findUserByGoogleId(googleSub);
+    const existingGoogle = await db.findUserByGoogleIdAsync(googleSub);
     if (existingGoogle && existingGoogle.id !== user.id) {
       return res.status(400).json({
         success: false,
@@ -6831,21 +7537,22 @@ authRouter.post("/link/google", requireAuth, async (req, res) => {
         message: "\u062D\u0633\u0627\u0628 Google \u0647\u0630\u0627 \u0645\u0631\u062A\u0628\u0637 \u0628\u062D\u0633\u0627\u0628 \u0622\u062E\u0631 \u0628\u0627\u0644\u0641\u0639\u0644."
       });
     }
-    const updated = db.linkAccountProvider(user.id, "google", {
+    const updated = user.organizationId ? await db.updateUserAsync(user.id, user.organizationId, {
       googleId: googleSub,
-      email: googleEmail
-    });
+      email: googleEmail,
+      authProviders: Array.from(/* @__PURE__ */ new Set([...user.authProviders || [], "google"]))
+    }) : void 0;
     db.logAction(user.organizationId, user.id, user.email, "LINK_PROVIDER", "User", user.id, { provider: "google" }, req.ip);
     return res.json({
       success: true,
       message: "\u062A\u0645 \u0631\u0628\u0637 \u062D\u0633\u0627\u0628 Google \u0628\u0646\u062C\u0627\u062D",
-      user: updated ? formatUserResponse(updated) : void 0
+      user: updated ? await formatUserResponseAsync(updated) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/link/phone", requireAuth, (req, res) => {
+authRouter.post("/link/phone", requireAuth, async (req, res) => {
   try {
     const { phone, code } = req.body;
     const user = req.user;
@@ -6861,7 +7568,7 @@ authRouter.post("/link/phone", requireAuth, (req, res) => {
       return res.status(400).json({ success: false, error: "INVALID_OTP", message: "\u0631\u0645\u0632 \u0627\u0644\u062A\u062D\u0642\u0642 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D" });
     }
     db.markPhoneOtpUsed(activeOtp.id);
-    const existingUser = db.findUserByPhone(phoneNorm.e164);
+    const existingUser = await db.findUserByPhoneAsync(phoneNorm.e164);
     if (existingUser && existingUser.id !== user.id) {
       return res.status(400).json({
         success: false,
@@ -6869,25 +7576,29 @@ authRouter.post("/link/phone", requireAuth, (req, res) => {
         message: "\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062A\u0641 \u0647\u0630\u0627 \u0645\u0631\u062A\u0628\u0637 \u0628\u062D\u0633\u0627\u0628 \u0645\u0633\u062A\u062E\u062F\u0645 \u0622\u062E\u0631"
       });
     }
-    const updated = db.linkAccountProvider(user.id, "phone", { phone: phoneNorm.e164 });
+    const updated = user.organizationId ? await db.updateUserAsync(user.id, user.organizationId, {
+      phone: phoneNorm.e164,
+      phoneVerified: true,
+      authProviders: Array.from(/* @__PURE__ */ new Set([...user.authProviders || [], "phone"]))
+    }) : void 0;
     db.logAction(user.organizationId, user.id, user.email, "LINK_PROVIDER", "User", user.id, { provider: "phone" }, req.ip);
     return res.json({
       success: true,
       message: "\u062A\u0645 \u0631\u0628\u0637 \u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062A\u0641 \u0628\u0646\u062C\u0627\u062D",
-      user: updated ? formatUserResponse(updated) : void 0
+      user: updated ? await formatUserResponseAsync(updated) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.delete("/unlink/:provider", requireAuth, (req, res) => {
+authRouter.delete("/unlink/:provider", requireAuth, async (req, res) => {
   try {
     const provider = req.params.provider;
     const user = req.user;
     if (!["email", "phone", "google"].includes(provider)) {
       return res.status(400).json({ success: false, error: "INVALID_PROVIDER", message: "\u0645\u0632\u0648\u062F \u0627\u0644\u0647\u0648\u064A\u0629 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D" });
     }
-    const result = db.unlinkAccountProvider(user.id, provider);
+    const result = user.organizationId ? await db.unlinkAccountProviderAsync(user.id, user.organizationId, provider) : { success: false, error: "USER_NOT_FOUND" };
     if (!result.success) {
       return res.status(400).json({
         success: false,
@@ -6899,26 +7610,26 @@ authRouter.delete("/unlink/:provider", requireAuth, (req, res) => {
     return res.json({
       success: true,
       message: `\u062A\u0645 \u0625\u0644\u063A\u0627\u0621 \u0631\u0628\u0637 ${provider} \u0628\u0646\u062C\u0627\u062D`,
-      user: result.user ? formatUserResponse(result.user) : void 0
+      user: result.user ? await formatUserResponseAsync(result.user) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.get("/profile", requireAuth, (req, res) => {
+authRouter.get("/profile", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const organization = req.organization;
     return res.json({
       success: true,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.put("/profile", requireAuth, (req, res) => {
+authRouter.put("/profile", requireAuth, async (req, res) => {
   try {
     const user = req.user;
     const { fullName, avatarUrl, phone } = req.body;
@@ -6931,18 +7642,18 @@ authRouter.put("/profile", requireAuth, (req, res) => {
         updates.phone = phoneNorm.e164;
       }
     }
-    const updated = db.updateUser(user.id, void 0, updates);
+    const updated = user.organizationId ? await db.updateUserAsync(user.id, user.organizationId, updates) : void 0;
     db.logAction(user.organizationId, user.id, user.email, "UPDATE_PROFILE", "User", user.id, updates, req.ip);
     return res.json({
       success: true,
       message: "\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u0645\u0644\u0641 \u0627\u0644\u0634\u062E\u0635\u064A \u0628\u0646\u062C\u0627\u062D",
-      user: updated ? formatUserResponse(updated) : void 0
+      user: updated ? await formatUserResponseAsync(updated) : void 0
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-var handleSwitchContext = (req, res) => {
+var handleSwitchContext = async (req, res) => {
   try {
     const { membershipId, contextType, organizationId, organizationSlug } = req.body;
     const user = req.user;
@@ -6958,12 +7669,12 @@ var handleSwitchContext = (req, res) => {
         },
         organization: null,
         activeRole: "GUEST",
-        user: formatUserResponse(user),
+        user: await formatUserResponseAsync(user),
         message: "\u062A\u0645 \u0627\u0644\u062A\u0628\u062F\u064A\u0644 \u0628\u0646\u062C\u0627\u062D \u0625\u0644\u0649 \u0627\u0644\u0645\u0633\u0627\u062D\u0629 \u0627\u0644\u0634\u062E\u0635\u064A\u0629"
       });
     }
     if (membershipId) {
-      const membership2 = db.getMembershipById(membershipId);
+      const membership2 = await db.getMembershipByIdAsync(membershipId);
       if (!membership2 || membership2.userId !== user.id) {
         return res.status(403).json({
           success: false,
@@ -6978,7 +7689,7 @@ var handleSwitchContext = (req, res) => {
           message: membership2.status === "PENDING_APPROVAL" ? "\u0637\u0644\u0628 \u0627\u0644\u0627\u0646\u0636\u0645\u0627\u0645 \u0642\u064A\u062F \u0627\u0644\u0645\u0631\u0627\u062C\u0639\u0629 \u0648\u0627\u0644\u0627\u0639\u062A\u0645\u0627\u062F \u0645\u0646 \u0625\u062F\u0627\u0631\u0629 \u0627\u0644\u0645\u062F\u0631\u0633\u0629" : "\u0647\u0630\u0647 \u0627\u0644\u0639\u0636\u0648\u064A\u0629 \u063A\u064A\u0631 \u0645\u0641\u0639\u0644\u0629 \u062D\u0627\u0644\u064A\u0627\u064B"
         });
       }
-      const targetOrg2 = db.getOrganizationById(membership2.organizationId);
+      const targetOrg2 = await db.getOrganizationByIdAsync(membership2.organizationId);
       if (!targetOrg2 || !targetOrg2.isActive) {
         return res.status(404).json({
           success: false,
@@ -7004,18 +7715,18 @@ var handleSwitchContext = (req, res) => {
         },
         organization: targetOrg2,
         activeRole: targetRole2,
-        user: formatUserResponse(user),
+        user: await formatUserResponseAsync(user),
         message: `\u062A\u0645 \u0627\u0644\u062A\u0628\u062F\u064A\u0644 \u0628\u0646\u062C\u0627\u062D \u0625\u0644\u0649: ${targetOrg2.name}`
       });
     }
-    let targetOrg = organizationId ? db.getOrganizationById(organizationId) : void 0;
+    let targetOrg = organizationId ? await db.getOrganizationByIdAsync(organizationId) : void 0;
     if (!targetOrg && organizationSlug) {
-      targetOrg = db.getOrganizationBySlug(organizationSlug);
+      targetOrg = await db.getOrganizationBySlugAsync(organizationSlug);
     }
     if (!targetOrg) {
       return res.status(404).json({ success: false, error: "ORGANIZATION_NOT_FOUND", message: "\u0627\u0644\u0645\u0624\u0633\u0633\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629" });
     }
-    const membership = db.getMembership(user.id, targetOrg.id);
+    const membership = await db.getMembershipAsync(user.id, targetOrg.id);
     if (!membership && user.role !== "SUPER_ADMIN") {
       return res.status(403).json({
         success: false,
@@ -7049,7 +7760,7 @@ var handleSwitchContext = (req, res) => {
       },
       organization: targetOrg,
       activeRole: targetRole,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       message: `\u062A\u0645 \u0627\u0644\u062A\u0628\u062F\u064A\u0644 \u0628\u0646\u062C\u0627\u062D \u0625\u0644\u0649: ${targetOrg.name}`
     });
   } catch {
@@ -7058,7 +7769,7 @@ var handleSwitchContext = (req, res) => {
 };
 authRouter.post("/switch-context", requireAuth, handleSwitchContext);
 authRouter.post("/switch-organization", requireAuth, handleSwitchContext);
-authRouter.get("/me", requireAuth, (req, res) => {
+authRouter.get("/me", requireAuth, async (req, res) => {
   const activeCtx = req.activeContext || {
     type: req.organization ? "ORGANIZATION" : "PERSONAL",
     role: req.user.role,
@@ -7068,7 +7779,7 @@ authRouter.get("/me", requireAuth, (req, res) => {
   };
   return res.json({
     success: true,
-    user: formatUserResponse(req.user),
+    user: await formatUserResponseAsync(req.user),
     organization: req.organization,
     activeContext: activeCtx,
     activeRole: req.user.role
@@ -7124,7 +7835,7 @@ authRouter.post("/demo-switch", (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/register-school", (req, res) => {
+authRouter.post("/register-school", async (req, res) => {
   try {
     const { schoolName, slug, legalName, adminName, adminEmail, password, countryCode } = req.body;
     const authenticatedUser = req.user;
@@ -7140,11 +7851,11 @@ authRouter.post("/register-school", (req, res) => {
     if (!isValidEmail(resolvedAdminEmail)) {
       return res.status(400).json({ success: false, error: "INVALID_EMAIL", message: "\u0635\u064A\u063A\u0629 \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0644\u0644\u0645\u062F\u064A\u0631 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D\u0629" });
     }
-    const existing = db.getOrganizationBySlug(cleanSlug);
+    const existing = await db.getOrganizationBySlugAsync(cleanSlug);
     if (existing) {
       return res.status(400).json({ success: false, error: "SLUG_TAKEN", message: "\u0627\u0633\u0645 \u0627\u0644\u0645\u0639\u0631\u0641 \u0644\u0644\u0645\u062F\u0631\u0633\u0629 \u0645\u0633\u062A\u062E\u062F\u0645 \u0628\u0627\u0644\u0641\u0639\u0644" });
     }
-    const org = db.createOrganization({
+    const org = await db.createOrganizationAsync({
       name: sanitizeString(schoolName),
       slug: cleanSlug,
       legalName: legalName ? sanitizeString(legalName) : void 0,
@@ -7155,22 +7866,24 @@ authRouter.post("/register-school", (req, res) => {
     });
     let admin;
     if (authenticatedUser) {
-      db.updateUser(authenticatedUser.id, void 0, {
-        organizationId: org.id,
-        role: "ORG_ADMIN",
-        fullName: resolvedAdminName
-      });
-      db.addMembership({
+      if (process.env.NODE_ENV !== "production") {
+        db.updateUser(authenticatedUser.id, void 0, {
+          organizationId: org.id,
+          role: "ORG_ADMIN",
+          fullName: resolvedAdminName
+        });
+      }
+      await db.addMembershipAsync({
         userId: authenticatedUser.id,
         organizationId: org.id,
         role: "ORG_ADMIN",
         isDefault: true,
         status: "ACTIVE"
       });
-      admin = db.getUserById(authenticatedUser.id);
+      admin = process.env.NODE_ENV !== "production" ? db.getUserById(authenticatedUser.id) : await db.getUserByIdAsync(authenticatedUser.id, org.id) || authenticatedUser;
     } else {
       const passwordHash = password ? hashPassword(password) : hashPassword("RtiqaAdmin2026!");
-      admin = db.createUser({
+      admin = await db.createUserAsync({
         organizationId: org.id,
         fullName: resolvedAdminName,
         email: resolvedAdminEmail,
@@ -7181,56 +7894,60 @@ authRouter.post("/register-school", (req, res) => {
         isActive: true
       });
     }
-    const year = db.createAcademicYear({
-      organizationId: org.id,
-      name: "2026-2027",
-      startDate: "2026-09-01",
-      endDate: "2027-06-30",
-      isCurrent: true
-    });
-    const term = db.createTerm({
-      organizationId: org.id,
-      academicYearId: year.id,
-      name: "\u0627\u0644\u0641\u0635\u0644 \u0627\u0644\u062F\u0631\u0627\u0633\u064A \u0627\u0644\u0623\u0648\u0644",
-      startDate: "2026-09-01",
-      endDate: "2027-01-15",
-      isCurrent: true
-    });
-    const grade = db.createGradeLevel({
-      organizationId: org.id,
-      name: "\u0627\u0644\u0635\u0641 \u0627\u0644\u0639\u0627\u0634\u0631",
-      sequenceOrder: 10
-    });
-    const classroom = db.createClassroom({
-      organizationId: org.id,
-      gradeLevelId: grade.id,
-      name: "\u0634\u0639\u0628\u0629 10-\u0623",
-      capacity: 30
-    });
-    const subject = db.createSubject({
-      organizationId: org.id,
-      name: "\u0627\u0644\u0631\u064A\u0627\u0636\u064A\u0627\u062A \u0627\u0644\u0639\u0627\u0645\u0629",
-      code: "MATH-10",
-      color: "#10b981",
-      description: "\u0645\u0646\u0647\u062C \u0627\u0644\u0631\u064A\u0627\u0636\u064A\u0627\u062A \u0644\u0644\u0645\u0631\u062D\u0644\u0629 \u0627\u0644\u062B\u0627\u0646\u0648\u064A\u0629"
-    });
-    db.logAction(org.id, admin.id, admin.email, "REGISTER_SCHOOL", "Organization", org.id, {
-      schoolName,
-      slug: cleanSlug
-    }, req.ip);
-    const token = generateToken(admin);
-    return res.json({
-      success: true,
-      token,
-      user: formatUserResponse(admin),
-      organization: org,
-      initialAcademicSetup: {
+    const initialAcademicSetup = process.env.NODE_ENV === "production" ? void 0 : (() => {
+      const year = db.createAcademicYear({
+        organizationId: org.id,
+        name: "2026-2027",
+        startDate: "2026-09-01",
+        endDate: "2027-06-30",
+        isCurrent: true
+      });
+      const term = db.createTerm({
+        organizationId: org.id,
+        academicYearId: year.id,
+        name: "\u0627\u0644\u0641\u0635\u0644 \u0627\u0644\u062F\u0631\u0627\u0633\u064A \u0627\u0644\u0623\u0648\u0644",
+        startDate: "2026-09-01",
+        endDate: "2027-01-15",
+        isCurrent: true
+      });
+      const grade = db.createGradeLevel({
+        organizationId: org.id,
+        name: "\u0627\u0644\u0635\u0641 \u0627\u0644\u0639\u0627\u0634\u0631",
+        sequenceOrder: 10
+      });
+      const classroom = db.createClassroom({
+        organizationId: org.id,
+        gradeLevelId: grade.id,
+        name: "\u0634\u0639\u0628\u0629 10-\u0623",
+        capacity: 30
+      });
+      const subject = db.createSubject({
+        organizationId: org.id,
+        name: "\u0627\u0644\u0631\u064A\u0627\u0636\u064A\u0627\u062A \u0627\u0644\u0639\u0627\u0645\u0629",
+        code: "MATH-10",
+        color: "#10b981",
+        description: "\u0645\u0646\u0647\u062C \u0627\u0644\u0631\u064A\u0627\u0636\u064A\u0627\u062A \u0644\u0644\u0645\u0631\u062D\u0644\u0629 \u0627\u0644\u062B\u0627\u0646\u0648\u064A\u0629"
+      });
+      return {
         academicYearId: year.id,
         termId: term.id,
         gradeLevelId: grade.id,
         classroomId: classroom.id,
         subjectId: subject.id
-      }
+      };
+    })();
+    db.logAction(org.id, admin.id, admin.email, "REGISTER_SCHOOL", "Organization", org.id, {
+      schoolName,
+      slug: cleanSlug
+    }, req.ip);
+    const membership = await db.getMembershipAsync(admin.id, org.id);
+    const token = generateToken(admin, org.id, membership?.role || "ORG_ADMIN", membership?.id, "ORGANIZATION");
+    return res.json({
+      success: true,
+      token,
+      user: await formatUserResponseAsync(admin),
+      organization: org,
+      initialAcademicSetup
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
@@ -7241,7 +7958,7 @@ authRouter.post(
   requireAuth,
   requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]),
   inviteLimiter,
-  (req, res) => {
+  async (req, res) => {
     try {
       const { email, role, fullName, classroomId, teacherSpecialization, studentIdNumber, expiresInDays = 7 } = req.body;
       if (!email || !role) {
@@ -7255,7 +7972,7 @@ authRouter.post(
       if (!validRoles.includes(role)) {
         return res.status(400).json({ success: false, error: "INVALID_ROLE", message: "\u0627\u0644\u062F\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F \u063A\u064A\u0631 \u0635\u0627\u0644\u062D" });
       }
-      const existingUser = db.findUserByEmail(normalizedEmail, req.organization.id);
+      const existingUser = await db.findUserByEmailAsync(normalizedEmail, req.organization.id);
       if (existingUser) {
         return res.status(400).json({
           success: false,
@@ -7263,7 +7980,7 @@ authRouter.post(
           message: "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u0645\u0633\u062C\u0644 \u0628\u0627\u0644\u0641\u0639\u0644 \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u062F\u0631\u0633\u0629"
         });
       }
-      if (classroomId && !db.isClassroomInOrg(classroomId, req.organization.id)) {
+      if (classroomId && !await db.isClassroomInOrgAsync(classroomId, req.organization.id)) {
         return res.status(400).json({
           success: false,
           error: "INVALID_CLASSROOM",
@@ -7272,7 +7989,7 @@ authRouter.post(
       }
       const inviteCode = generateInviteCode();
       const expiresAt = new Date(Date.now() + Math.max(1, Number(expiresInDays)) * 24 * 60 * 60 * 1e3).toISOString();
-      const invitation = db.createInvitation({
+      const invitation = await db.createInvitationAsync({
         organizationId: req.organization.id,
         email: normalizedEmail,
         role,
@@ -7319,9 +8036,9 @@ authRouter.get(
   "/invitations",
   requireAuth,
   requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]),
-  (req, res) => {
+  async (req, res) => {
     try {
-      const invitations = db.getInvitationsByOrg(req.organization.id);
+      const invitations = await db.getInvitationsByOrgAsync(req.organization.id);
       return res.json({
         success: true,
         data: invitations
@@ -7335,10 +8052,10 @@ authRouter.delete(
   "/invitations/:id",
   requireAuth,
   requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]),
-  (req, res) => {
+  async (req, res) => {
     try {
       const { id } = req.params;
-      const revoked = db.revokeInvitation(id, req.organization.id);
+      const revoked = await db.revokeInvitationAsync(id, req.organization.id);
       if (!revoked) {
         return res.status(404).json({ success: false, error: "NOT_FOUND", message: "\u0627\u0644\u062F\u0639\u0648\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629" });
       }
@@ -7349,13 +8066,13 @@ authRouter.delete(
     }
   }
 );
-authRouter.get("/invitations/verify", (req, res) => {
+authRouter.get("/invitations/verify", async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) {
       return res.status(400).json({ success: false, error: "CODE_REQUIRED", message: "\u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629 \u0645\u0637\u0644\u0648\u0628" });
     }
-    const invitation = db.getInvitationByCode(code);
+    const invitation = await db.getInvitationByCodeAsync(code);
     if (!invitation) {
       return res.status(404).json({ success: false, error: "INVALID_CODE", message: "\u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D \u0623\u0648 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F" });
     }
@@ -7365,7 +8082,7 @@ authRouter.get("/invitations/verify", (req, res) => {
     if (new Date(invitation.expiresAt).getTime() < Date.now()) {
       return res.status(400).json({ success: false, error: "EXPIRED", message: "\u0627\u0646\u062A\u0647\u062A \u0635\u0644\u0627\u062D\u064A\u0629 \u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629" });
     }
-    const org = db.getOrganizationById(invitation.organizationId);
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
     return res.json({
       success: true,
       data: {
@@ -7388,7 +8105,7 @@ authRouter.get("/invitations/verify", (req, res) => {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/invitations/accept", acceptInviteLimiter, (req, res) => {
+authRouter.post("/invitations/accept", acceptInviteLimiter, async (req, res) => {
   try {
     const { code, fullName, password } = req.body;
     if (!code || !password) {
@@ -7397,7 +8114,7 @@ authRouter.post("/invitations/accept", acceptInviteLimiter, (req, res) => {
     if (typeof password !== "string" || password.length < 6) {
       return res.status(400).json({ success: false, error: "WEAK_PASSWORD", message: "\u0643\u0644\u0645\u0629 \u0627\u0644\u0645\u0631\u0648\u0631 \u064A\u062C\u0628 \u0623\u0646 \u0644\u0627 \u062A\u0642\u0644 \u0639\u0646 6 \u0623\u062D\u0631\u0641" });
     }
-    const invitation = db.getInvitationByCode(code);
+    const invitation = await db.getInvitationByCodeAsync(code);
     if (!invitation) {
       return res.status(404).json({ success: false, error: "INVALID_CODE", message: "\u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D" });
     }
@@ -7407,13 +8124,13 @@ authRouter.post("/invitations/accept", acceptInviteLimiter, (req, res) => {
     if (new Date(invitation.expiresAt).getTime() < Date.now()) {
       return res.status(400).json({ success: false, error: "EXPIRED", message: "\u0627\u0646\u062A\u0647\u062A \u0635\u0644\u0627\u062D\u064A\u0629 \u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629" });
     }
-    const existing = db.findUserByEmail(invitation.email, invitation.organizationId);
+    const existing = await db.findUserByEmailAsync(invitation.email, invitation.organizationId);
     if (existing) {
       return res.status(400).json({ success: false, error: "USER_EXISTS", message: "\u0627\u0644\u062D\u0633\u0627\u0628 \u0645\u0641\u0639\u0644 \u0645\u0633\u0628\u0642\u0627\u064B" });
     }
     const passwordHash = hashPassword(password);
     const resolvedName = fullName ? sanitizeString(fullName) : invitation.fullName || invitation.email.split("@")[0];
-    const newUser = db.createUser({
+    const newUser = await db.createUserAsync({
       organizationId: invitation.organizationId,
       email: invitation.email,
       fullName: resolvedName,
@@ -7426,9 +8143,13 @@ authRouter.post("/invitations/accept", acceptInviteLimiter, (req, res) => {
       authProviders: ["email"],
       isActive: true
     });
-    db.markInvitationUsed(invitation.id, invitation.organizationId);
-    const org = db.getOrganizationById(invitation.organizationId);
-    const token = generateToken(newUser);
+    const claimed = await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
+    if (!claimed) {
+      return res.status(409).json({ success: false, error: "INVITATION_UNAVAILABLE", message: "\u0627\u0644\u062F\u0639\u0648\u0629 \u0645\u0633\u062A\u062E\u062F\u0645\u0629 \u0623\u0648 \u0645\u0646\u062A\u0647\u064A\u0629 \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629" });
+    }
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
+    const membership = await db.getMembershipAsync(newUser.id, invitation.organizationId);
+    const token = generateToken(newUser, invitation.organizationId, membership?.role || invitation.role, membership?.id, "ORGANIZATION");
     db.logAction(
       invitation.organizationId,
       newUser.id,
@@ -7442,14 +8163,14 @@ authRouter.post("/invitations/accept", acceptInviteLimiter, (req, res) => {
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(newUser),
+      user: await formatUserResponseAsync(newUser),
       organization: org
     });
   } catch {
     return res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-authRouter.post("/join-school", acceptInviteLimiter, (req, res) => {
+authRouter.post("/join-school", acceptInviteLimiter, async (req, res) => {
   try {
     const { inviteCode } = req.body;
     const user = req.user;
@@ -7459,7 +8180,7 @@ authRouter.post("/join-school", acceptInviteLimiter, (req, res) => {
     if (!inviteCode) {
       return res.status(400).json({ success: false, error: "CODE_REQUIRED", message: "\u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629 \u0645\u0637\u0644\u0648\u0628" });
     }
-    const invitation = db.getInvitationByCode(inviteCode);
+    const invitation = await db.getInvitationByCodeAsync(inviteCode);
     if (!invitation) {
       return res.status(404).json({ success: false, error: "INVALID_CODE", message: "\u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629 \u063A\u064A\u0631 \u0635\u062D\u064A\u062D" });
     }
@@ -7469,11 +8190,11 @@ authRouter.post("/join-school", acceptInviteLimiter, (req, res) => {
     if (new Date(invitation.expiresAt).getTime() < Date.now()) {
       return res.status(400).json({ success: false, error: "EXPIRED", message: "\u0627\u0646\u062A\u0647\u062A \u0635\u0644\u0627\u062D\u064A\u0629 \u0631\u0645\u0632 \u0627\u0644\u062F\u0639\u0648\u0629" });
     }
-    const existingMembership = db.getMembership(user.id, invitation.organizationId);
+    const existingMembership = await db.getMembershipAsync(user.id, invitation.organizationId);
     if (existingMembership) {
       return res.status(400).json({ success: false, error: "ALREADY_MEMBER", message: "\u0644\u062F\u064A\u0643 \u0639\u0636\u0648\u064A\u0629 \u0628\u0627\u0644\u0641\u0639\u0644 \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u062F\u0631\u0633\u0629" });
     }
-    db.addMembership({
+    await db.addMembershipAsync({
       userId: user.id,
       organizationId: invitation.organizationId,
       role: invitation.role,
@@ -7491,11 +8212,19 @@ authRouter.post("/join-school", acceptInviteLimiter, (req, res) => {
       if (invitation.teacherSpecialization) updates.teacherSpecialization = invitation.teacherSpecialization;
       if (invitation.studentIdNumber) updates.studentIdNumber = invitation.studentIdNumber;
     }
-    db.updateUser(user.id, void 0, updates);
-    db.markInvitationUsed(invitation.id, invitation.organizationId);
-    const updatedUser = db.getUserById(user.id);
-    const org = db.getOrganizationById(invitation.organizationId);
-    const token = generateToken(updatedUser, invitation.organizationId, invitation.role);
+    if (process.env.NODE_ENV !== "production") {
+      db.updateUser(user.id, void 0, updates);
+    } else if (user.organizationId === invitation.organizationId) {
+      await db.updateUserAsync(user.id, invitation.organizationId, updates);
+    }
+    const claimed = await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
+    if (!claimed) {
+      return res.status(409).json({ success: false, error: "INVITATION_UNAVAILABLE", message: "\u0627\u0644\u062F\u0639\u0648\u0629 \u0645\u0633\u062A\u062E\u062F\u0645\u0629 \u0623\u0648 \u0645\u0646\u062A\u0647\u064A\u0629 \u0627\u0644\u0635\u0644\u0627\u062D\u064A\u0629" });
+    }
+    const updatedUser = process.env.NODE_ENV !== "production" ? db.getUserById(user.id) : await db.getUserByIdAsync(user.id, user.organizationId);
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
+    const membership = await db.getMembershipAsync(user.id, invitation.organizationId);
+    const token = generateToken(updatedUser, invitation.organizationId, membership?.role || invitation.role, membership?.id, "ORGANIZATION");
     db.logAction(
       invitation.organizationId,
       user.id,
@@ -7509,7 +8238,7 @@ authRouter.post("/join-school", acceptInviteLimiter, (req, res) => {
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(updatedUser),
+      user: await formatUserResponseAsync(updatedUser),
       organization: org,
       message: `\u062A\u0645 \u0627\u0644\u0627\u0646\u0636\u0645\u0627\u0645 \u0628\u0646\u062C\u0627\u062D \u0625\u0644\u0649 \u0645\u062F\u0631\u0633\u0629: ${org?.name}`
     });
@@ -8130,12 +8859,12 @@ init_security();
 var userRouter = express3.Router();
 userRouter.use(requireAuth);
 var EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-userRouter.get("/", (req, res) => {
+userRouter.get("/", async (req, res) => {
   try {
     const role = req.query.role;
     const classroomId = req.query.classroomId;
     const search = req.query.search?.toLowerCase().trim();
-    let users = db.getUsersByOrg(req.organization.id, role);
+    let users = await db.getUsersByOrgAsync(req.organization.id, role);
     if (classroomId) {
       users = users.filter((u) => u.classroomId === classroomId);
     }
@@ -8164,7 +8893,7 @@ userRouter.get("/", (req, res) => {
     res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-userRouter.post("/", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) => {
+userRouter.post("/", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), async (req, res) => {
   try {
     const { email, fullName, role, phone, studentIdNumber, teacherSpecialization, classroomId } = req.body;
     if (!email || !fullName || !role) {
@@ -8178,14 +8907,14 @@ userRouter.post("/", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) => {
     if (!validRoles.includes(role)) {
       return res.status(400).json({ success: false, error: "INVALID_ROLE", message: "\u0627\u0644\u062F\u0648\u0631 \u0627\u0644\u0645\u062D\u062F\u062F \u063A\u064A\u0631 \u0635\u0627\u0644\u062D" });
     }
-    if (classroomId && !db.isClassroomInOrg(classroomId, req.organization.id)) {
+    if (classroomId && !await db.isClassroomInOrgAsync(classroomId, req.organization.id)) {
       return res.status(400).json({ success: false, error: "INVALID_CLASSROOM", message: "\u0627\u0644\u0634\u0639\u0628\u0629 \u0627\u0644\u062F\u0631\u0627\u0633\u064A\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629 \u0641\u064A \u0627\u0644\u0645\u0624\u0633\u0633\u0629" });
     }
-    const existing = db.findUserByEmail(normalizedEmail, req.organization.id);
+    const existing = await db.findUserByEmailAsync(normalizedEmail, req.organization.id);
     if (existing) {
       return res.status(400).json({ success: false, error: "EMAIL_EXISTS", message: "\u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0645\u0633\u062C\u0644 \u0645\u0633\u0628\u0642\u0627\u064B \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u0624\u0633\u0633\u0629" });
     }
-    const user = db.createUser({
+    const user = await db.createUserAsync({
       organizationId: req.organization.id,
       email: normalizedEmail,
       fullName: sanitizeString(fullName),
@@ -8221,7 +8950,7 @@ function parseCsvRows(csvContent) {
 userRouter.post(
   "/import-csv/preview",
   requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]),
-  (req, res) => {
+  async (req, res) => {
     try {
       const { csvContent, targetRole = "STUDENT", targetClassroomId } = req.body;
       if (!csvContent || typeof csvContent !== "string") {
@@ -8235,7 +8964,7 @@ userRouter.post(
       const seenEmailsInFile = /* @__PURE__ */ new Set();
       let validCount = 0;
       let errorCount = 0;
-      rows.forEach((line, index) => {
+      for (const [index, line] of rows.entries()) {
         const cols = line.split(/[,;\t]/).map((c) => c.trim().replace(/^["']|["']$/g, ""));
         const name = cols[0] || "";
         const rawEmail = cols[1] || "";
@@ -8254,7 +8983,7 @@ userRouter.post(
             isValid: false,
             errorMessage: "\u0627\u0644\u0627\u0633\u0645 \u0648\u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u062D\u0642\u0644\u0627\u0646 \u0625\u0644\u0632\u0627\u0645\u064A\u0627\u0646"
           });
-          return;
+          continue;
         }
         if (!EMAIL_REGEX.test(email)) {
           errorCount++;
@@ -8267,7 +8996,7 @@ userRouter.post(
             isValid: false,
             errorMessage: "\u0635\u064A\u063A\u0629 \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629"
           });
-          return;
+          continue;
         }
         if (seenEmailsInFile.has(email)) {
           errorCount++;
@@ -8280,10 +9009,10 @@ userRouter.post(
             isValid: false,
             errorMessage: "\u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A \u0645\u0643\u0631\u0631 \u0641\u064A \u0627\u0644\u0645\u0644\u0641"
           });
-          return;
+          continue;
         }
         seenEmailsInFile.add(email);
-        if (db.findUserByEmail(email, req.organization.id)) {
+        if (await db.findUserByEmailAsync(email, req.organization.id)) {
           errorCount++;
           previewRows.push({
             row: rowNum,
@@ -8294,7 +9023,7 @@ userRouter.post(
             isValid: false,
             errorMessage: "\u0627\u0644\u0628\u0631\u064A\u062F \u0645\u0633\u062C\u0644 \u0628\u0627\u0644\u0641\u0639\u0644 \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u062F\u0631\u0633\u0629"
           });
-          return;
+          continue;
         }
         validCount++;
         previewRows.push({
@@ -8305,7 +9034,7 @@ userRouter.post(
           phone,
           isValid: true
         });
-      });
+      }
       return res.json({
         success: true,
         summary: {
@@ -8322,13 +9051,13 @@ userRouter.post(
     }
   }
 );
-userRouter.post("/import-csv", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) => {
+userRouter.post("/import-csv", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), async (req, res) => {
   try {
     const { csvContent, targetClassroomId, targetRole = "STUDENT" } = req.body;
     if (!csvContent || typeof csvContent !== "string") {
       return res.status(400).json({ success: false, error: "NO_CSV_DATA", message: "\u064A\u0631\u062C\u0649 \u0625\u0631\u0633\u0627\u0644 \u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0644\u0641 CSV" });
     }
-    if (targetClassroomId && !db.isClassroomInOrg(targetClassroomId, req.organization.id)) {
+    if (targetClassroomId && !await db.isClassroomInOrgAsync(targetClassroomId, req.organization.id)) {
       return res.status(400).json({ success: false, error: "INVALID_CLASSROOM", message: "\u0627\u0644\u0634\u0639\u0628\u0629 \u0627\u0644\u0645\u062D\u062F\u062F\u0629 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F\u0629 \u0641\u064A \u0627\u0644\u0645\u0624\u0633\u0633\u0629" });
     }
     const { rows } = parseCsvRows(csvContent);
@@ -8338,33 +9067,33 @@ userRouter.post("/import-csv", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req,
     const imported = [];
     const errors = [];
     const seenEmailsInFile = /* @__PURE__ */ new Set();
-    rows.forEach((line, index) => {
+    for (const [index, line] of rows.entries()) {
       const cols = line.split(/[,;\t]/).map((c) => c.trim().replace(/^["']|["']$/g, ""));
       if (cols.length < 2) {
         errors.push({ row: index + 2, reason: "\u062A\u0646\u0633\u064A\u0642 \u0627\u0644\u0635\u0641 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D" });
-        return;
+        continue;
       }
       const [name, rawEmail, customIdentifier, phone] = cols;
       if (!name || !rawEmail) {
         errors.push({ row: index + 2, reason: "\u0627\u0644\u0627\u0633\u0645 \u0623\u0648 \u0627\u0644\u0628\u0631\u064A\u062F \u0645\u0641\u0642\u0648\u062F" });
-        return;
+        continue;
       }
       const email = rawEmail.toLowerCase().trim();
       if (!EMAIL_REGEX.test(email)) {
         errors.push({ row: index + 2, reason: `\u0635\u064A\u063A\u0629 \u0627\u0644\u0628\u0631\u064A\u062F \u0627\u0644\u0625\u0644\u0643\u062A\u0631\u0648\u0646\u064A (${email}) \u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629` });
-        return;
+        continue;
       }
       if (seenEmailsInFile.has(email)) {
         errors.push({ row: index + 2, reason: `\u0627\u0644\u0628\u0631\u064A\u062F (${email}) \u0645\u0643\u0631\u0631 \u0641\u064A \u0627\u0644\u0645\u0644\u0641 \u0646\u0641\u0633\u0647` });
-        return;
+        continue;
       }
       seenEmailsInFile.add(email);
-      if (db.findUserByEmail(email, req.organization.id)) {
+      if (await db.findUserByEmailAsync(email, req.organization.id)) {
         errors.push({ row: index + 2, reason: `\u0627\u0644\u0628\u0631\u064A\u062F (${email}) \u0645\u0648\u062C\u0648\u062F \u0645\u0633\u0628\u0642\u0627\u064B \u0641\u064A \u0642\u0627\u0639\u062F\u0629 \u0627\u0644\u0628\u064A\u0627\u0646\u0627\u062A` });
-        return;
+        continue;
       }
       const role = targetRole === "TEACHER" ? "TEACHER" : "STUDENT";
-      const user = db.createUser({
+      const user = await db.createUserAsync({
         organizationId: req.organization.id,
         email,
         fullName: name.trim(),
@@ -8376,7 +9105,7 @@ userRouter.post("/import-csv", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req,
         isActive: true
       });
       imported.push(user);
-    });
+    }
     db.logAction(
       req.organization.id,
       req.user.id,
@@ -8401,18 +9130,18 @@ userRouter.post("/import-csv", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req,
     res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-userRouter.put("/:id", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) => {
+userRouter.put("/:id", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), async (req, res) => {
   try {
     const { id } = req.params;
     const { email, fullName, role, phone, studentIdNumber, teacherSpecialization, classroomId, isActive } = req.body;
-    const existingUser = db.getUserById(id, req.organization.id);
+    const existingUser = await db.getUserByIdAsync(id, req.organization.id);
     if (!existingUser) {
       return res.status(404).json({ success: false, error: "USER_NOT_FOUND", message: "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u0624\u0633\u0633\u0629" });
     }
     if (id === req.user.id && isActive === false) {
       return res.status(400).json({ success: false, error: "CANNOT_DEACTIVATE_SELF", message: "\u0644\u0627 \u064A\u0645\u0643\u0646\u0643 \u062A\u0639\u0637\u064A\u0644 \u062D\u0633\u0627\u0628\u0643 \u0627\u0644\u062E\u0627\u0635" });
     }
-    if (classroomId && !db.isClassroomInOrg(classroomId, req.organization.id)) {
+    if (classroomId && !await db.isClassroomInOrgAsync(classroomId, req.organization.id)) {
       return res.status(400).json({ success: false, error: "INVALID_CLASSROOM", message: "\u0627\u0644\u0634\u0639\u0628\u0629 \u0627\u0644\u062F\u0631\u0627\u0633\u064A\u0629 \u063A\u064A\u0631 \u0635\u0627\u0644\u062D\u0629" });
     }
     const updates = {};
@@ -8425,20 +9154,26 @@ userRouter.put("/:id", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) =>
     if (role && ["ORG_ADMIN", "TEACHER", "STUDENT", "PARENT"].includes(role)) {
       updates.role = role;
     }
-    const updated = db.updateUser(id, req.organization.id, updates);
+    const updated = await db.updateUserAsync(id, req.organization.id, updates);
+    if (updated && updates.role) {
+      const membership = await db.getMembershipAsync(id, req.organization.id);
+      if (membership) {
+        await db.updateMembershipAsync(membership.id, req.organization.id, { role: updates.role });
+      }
+    }
     db.logAction(req.organization.id, req.user.id, req.user.email, "UPDATE_USER", "User", id, { updates }, req.ip);
     res.json({ success: true, data: updated });
   } catch {
     res.status(500).json({ success: false, error: "SERVER_ERROR" });
   }
 });
-userRouter.delete("/:id", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), (req, res) => {
+userRouter.delete("/:id", requireRoles(["ORG_ADMIN", "SUPER_ADMIN"]), async (req, res) => {
   try {
     const { id } = req.params;
     if (id === req.user.id) {
       return res.status(400).json({ success: false, error: "CANNOT_DELETE_SELF", message: "\u0644\u0627 \u064A\u0645\u0643\u0646\u0643 \u062D\u0630\u0641 \u062D\u0633\u0627\u0628\u0643 \u0627\u0644\u062E\u0627\u0635" });
     }
-    const deleted = db.deleteUser(id, req.organization.id);
+    const deleted = await db.deleteUserAsync(id, req.organization.id);
     if (!deleted) {
       return res.status(404).json({ success: false, error: "USER_NOT_FOUND", message: "\u0627\u0644\u0645\u0633\u062A\u062E\u062F\u0645 \u063A\u064A\u0631 \u0645\u0648\u062C\u0648\u062F \u0641\u064A \u0647\u0630\u0647 \u0627\u0644\u0645\u0624\u0633\u0633\u0629" });
     }
@@ -13108,8 +13843,18 @@ platformApiRouter.use("/library", requireOrg, libraryRouter);
 
 // server.ts
 init_postgres();
+init_migrate();
+init_db();
 async function createApp() {
   assertProductionAuthSecret();
+  if (process.env.NODE_ENV === "production") {
+    const migrationResult = await runMigrations();
+    if (!migrationResult.success) {
+      throw new Error(`[FATAL MIGRATION ERROR] ${migrationResult.message}`);
+    }
+    await assertProductionPostgres();
+    await db.initializeFromPostgres();
+  }
   const app = express16();
   app.use((req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -13374,7 +14119,6 @@ async function createApp() {
   return app;
 }
 async function startServer() {
-  await assertProductionPostgres();
   const app = await createApp();
   const PORT = 3e3;
   const server = app.listen(PORT, "0.0.0.0", () => {
@@ -13396,7 +14140,7 @@ async function startServer() {
   return server;
 }
 var isDirectRun = Boolean(
-  process.argv.some((arg) => arg.includes("server.ts") || arg.includes("server.cjs") || arg.includes("server.js")) || process.argv[1] && fileURLToPath(import.meta.url) === path2.resolve(process.argv[1])
+  process.argv.some((arg) => arg.includes("server.ts") || arg.includes("server.cjs") || arg.includes("server.js"))
 );
 if (isDirectRun && process.env.NODE_ENV !== "test") {
   startServer().catch((err) => {

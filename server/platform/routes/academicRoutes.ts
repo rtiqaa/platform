@@ -11,18 +11,18 @@ academicRouter.use(requireAuth);
 // 1. Academic Years
 // ==========================================
 
-academicRouter.get('/years', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/years', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const years = db.getAcademicYears(req.organization!.id);
+    const years = await db.getAcademicYearsAsync(req.organization!.id);
     res.json({ success: true, data: years });
   } catch {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
-academicRouter.get('/years/:id', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/years/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const year = db.getAcademicYearById(req.params.id, req.organization!.id);
+    const year = await db.getAcademicYearByIdAsync(req.params.id, req.organization!.id);
     if (!year) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'السنة الأكاديمية غير موجودة' });
     }
@@ -32,7 +32,7 @@ academicRouter.get('/years/:id', (req: PlatformRequest, res: express.Response) =
   }
 });
 
-academicRouter.post('/years', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/years', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { name, startDate, endDate, isCurrent } = req.body;
     if (!name || !startDate || !endDate) {
@@ -42,7 +42,7 @@ academicRouter.post('/years', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: 
         message: 'اسم السنة الأكاديمية وتواريخ البداية والنهاية مطلوبة',
       });
     }
-    const year = db.createAcademicYear({
+    const year = await db.createAcademicYearAsync({
       organizationId: req.organization!.id,
       name: String(name).trim(),
       startDate,
@@ -55,14 +55,14 @@ academicRouter.post('/years', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: 
   }
 });
 
-academicRouter.put('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getAcademicYearById(req.params.id, req.organization!.id);
+    const existing = await db.getAcademicYearByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'السنة الأكاديمية غير موجودة' });
     }
     const { name, startDate, endDate, isCurrent } = req.body;
-    const updated = db.updateAcademicYear(req.params.id, req.organization!.id, {
+    const updated = await db.updateAcademicYearAsync(req.params.id, req.organization!.id, {
       name: name ? String(name).trim() : undefined,
       startDate,
       endDate,
@@ -74,9 +74,9 @@ academicRouter.put('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (re
   }
 });
 
-academicRouter.delete('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteAcademicYear(req.params.id, req.organization!.id);
+    const success = await db.deleteAcademicYearAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'السنة الأكاديمية غير موجودة' });
     }
@@ -90,19 +90,19 @@ academicRouter.delete('/years/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
 // 2. Terms
 // ==========================================
 
-academicRouter.get('/terms', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/terms', async (req: PlatformRequest, res: express.Response) => {
   try {
     const yearId = req.query.yearId as string | undefined;
-    const terms = db.getTerms(req.organization!.id, yearId);
+    const terms = await db.getTermsAsync(req.organization!.id, yearId);
     res.json({ success: true, data: terms });
   } catch {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
-academicRouter.get('/terms/:id', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/terms/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const term = db.getTermById(req.params.id, req.organization!.id);
+    const term = await db.getTermByIdAsync(req.params.id, req.organization!.id);
     if (!term) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الفصل الدراسي غير موجود' });
     }
@@ -112,18 +112,17 @@ academicRouter.get('/terms/:id', (req: PlatformRequest, res: express.Response) =
   }
 });
 
-academicRouter.post('/terms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/terms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { academicYearId, name, startDate, endDate, isCurrent } = req.body;
     if (!academicYearId || !name || !startDate || !endDate) {
       return res.status(400).json({ success: false, error: 'MISSING_FIELDS', message: 'جميع بيانات الفصل الدراسي مطلوبة' });
     }
-
-    if (!db.isAcademicYearInOrg(academicYearId, req.organization!.id)) {
+    const yearExists = await db.getAcademicYearByIdAsync(academicYearId, req.organization!.id);
+    if (!yearExists) {
       return res.status(400).json({ success: false, error: 'INVALID_YEAR', message: 'السنة الأكاديمية غير موجودة في المؤسسة' });
     }
-
-    const term = db.createTerm({
+    const term = await db.createTermAsync({
       organizationId: req.organization!.id,
       academicYearId,
       name: String(name).trim(),
@@ -137,17 +136,17 @@ academicRouter.post('/terms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: 
   }
 });
 
-academicRouter.put('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getTermById(req.params.id, req.organization!.id);
+    const existing = await db.getTermByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الفصل الدراسي غير موجود' });
     }
     const { name, startDate, endDate, isCurrent, academicYearId } = req.body;
-    if (academicYearId && !db.isAcademicYearInOrg(academicYearId, req.organization!.id)) {
+    if (academicYearId && !(await db.getAcademicYearByIdAsync(academicYearId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_YEAR', message: 'السنة الأكاديمية غير صالحة' });
     }
-    const updated = db.updateTerm(req.params.id, req.organization!.id, {
+    const updated = await db.updateTermAsync(req.params.id, req.organization!.id, {
       name: name ? String(name).trim() : undefined,
       startDate,
       endDate,
@@ -160,9 +159,9 @@ academicRouter.put('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (re
   }
 });
 
-academicRouter.delete('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteTerm(req.params.id, req.organization!.id);
+    const success = await db.deleteTermAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الفصل الدراسي غير موجود' });
     }
@@ -176,18 +175,18 @@ academicRouter.delete('/terms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
 // 3. Grade Levels
 // ==========================================
 
-academicRouter.get('/grades', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/grades', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const grades = db.getGradeLevels(req.organization!.id);
+    const grades = await db.getGradeLevelsAsync(req.organization!.id);
     res.json({ success: true, data: grades });
   } catch {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
-academicRouter.get('/grades/:id', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/grades/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const grade = db.getGradeLevelById(req.params.id, req.organization!.id);
+    const grade = await db.getGradeLevelByIdAsync(req.params.id, req.organization!.id);
     if (!grade) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المرحلة الدراسية غير موجودة' });
     }
@@ -197,11 +196,11 @@ academicRouter.get('/grades/:id', (req: PlatformRequest, res: express.Response) 
   }
 });
 
-academicRouter.post('/grades', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/grades', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { name, sequenceOrder } = req.body;
     if (!name) return res.status(400).json({ success: false, error: 'NAME_REQUIRED', message: 'اسم المرحلة/الصف مطلوب' });
-    const grade = db.createGradeLevel({
+    const grade = await db.createGradeLevelAsync({
       organizationId: req.organization!.id,
       name: String(name).trim(),
       sequenceOrder: Number(sequenceOrder) || 1,
@@ -212,14 +211,14 @@ academicRouter.post('/grades', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req:
   }
 });
 
-academicRouter.put('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getGradeLevelById(req.params.id, req.organization!.id);
+    const existing = await db.getGradeLevelByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المرحلة الدراسية غير موجودة' });
     }
     const { name, sequenceOrder } = req.body;
-    const updated = db.updateGradeLevel(req.params.id, req.organization!.id, {
+    const updated = await db.updateGradeLevelAsync(req.params.id, req.organization!.id, {
       name: name ? String(name).trim() : undefined,
       sequenceOrder: sequenceOrder !== undefined ? Number(sequenceOrder) : undefined,
     });
@@ -229,9 +228,9 @@ academicRouter.put('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (r
   }
 });
 
-academicRouter.delete('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteGradeLevel(req.params.id, req.organization!.id);
+    const success = await db.deleteGradeLevelAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المرحلة الدراسية غير موجودة' });
     }
@@ -245,19 +244,19 @@ academicRouter.delete('/grades/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']),
 // 4. Classrooms / Sections
 // ==========================================
 
-academicRouter.get('/classrooms', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/classrooms', async (req: PlatformRequest, res: express.Response) => {
   try {
     const gradeLevelId = req.query.gradeLevelId as string | undefined;
-    const classrooms = db.getClassrooms(req.organization!.id, gradeLevelId);
+    const classrooms = await db.getClassroomsAsync(req.organization!.id, gradeLevelId);
     res.json({ success: true, data: classrooms });
   } catch {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
-academicRouter.get('/classrooms/:id', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/classrooms/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const classroom = db.getClassroomById(req.params.id, req.organization!.id);
+    const classroom = await db.getClassroomByIdAsync(req.params.id, req.organization!.id);
     if (!classroom) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الشعبة غير موجودة' });
     }
@@ -267,18 +266,18 @@ academicRouter.get('/classrooms/:id', (req: PlatformRequest, res: express.Respon
   }
 });
 
-academicRouter.post('/classrooms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/classrooms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { gradeLevelId, name, capacity } = req.body;
     if (!gradeLevelId || !name) {
       return res.status(400).json({ success: false, error: 'MISSING_FIELDS', message: 'الصف والمرحلة مطلوبة' });
     }
 
-    if (!db.isGradeLevelInOrg(gradeLevelId, req.organization!.id)) {
+    if (!(await db.getGradeLevelByIdAsync(gradeLevelId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_GRADE_LEVEL', message: 'المرحلة الدراسية غير صالحة' });
     }
 
-    const classroom = db.createClassroom({
+    const classroom = await db.createClassroomAsync({
       organizationId: req.organization!.id,
       gradeLevelId,
       name: String(name).trim(),
@@ -290,17 +289,17 @@ academicRouter.post('/classrooms', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (
   }
 });
 
-academicRouter.put('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getClassroomById(req.params.id, req.organization!.id);
+    const existing = await db.getClassroomByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الشعبة غير موجودة' });
     }
     const { name, gradeLevelId, capacity } = req.body;
-    if (gradeLevelId && !db.isGradeLevelInOrg(gradeLevelId, req.organization!.id)) {
+    if (gradeLevelId && !(await db.getGradeLevelByIdAsync(gradeLevelId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_GRADE_LEVEL', message: 'المرحلة الدراسية غير صالحة' });
     }
-    const updated = db.updateClassroom(req.params.id, req.organization!.id, {
+    const updated = await db.updateClassroomAsync(req.params.id, req.organization!.id, {
       name: name ? String(name).trim() : undefined,
       gradeLevelId,
       capacity: capacity !== undefined ? Number(capacity) : undefined,
@@ -311,9 +310,9 @@ academicRouter.put('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN'])
   }
 });
 
-academicRouter.delete('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteClassroom(req.params.id, req.organization!.id);
+    const success = await db.deleteClassroomAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الشعبة غير موجودة' });
     }
@@ -327,18 +326,18 @@ academicRouter.delete('/classrooms/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN
 // 5. Subjects
 // ==========================================
 
-academicRouter.get('/subjects', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/subjects', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const subjects = db.getSubjects(req.organization!.id);
+    const subjects = await db.getSubjectsAsync(req.organization!.id);
     res.json({ success: true, data: subjects });
   } catch {
     res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
-academicRouter.get('/subjects/:id', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/subjects/:id', async (req: PlatformRequest, res: express.Response) => {
   try {
-    const subject = db.getSubjectById(req.params.id, req.organization!.id);
+    const subject = await db.getSubjectByIdAsync(req.params.id, req.organization!.id);
     if (!subject) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المادة غير موجودة' });
     }
@@ -348,13 +347,13 @@ academicRouter.get('/subjects/:id', (req: PlatformRequest, res: express.Response
   }
 });
 
-academicRouter.post('/subjects', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/subjects', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { name, code, color, description } = req.body;
     if (!name || !code) {
       return res.status(400).json({ success: false, error: 'NAME_AND_CODE_REQUIRED', message: 'اسم المادة والرمز التعريفي مطلوبين' });
     }
-    const subject = db.createSubject({
+    const subject = await db.createSubjectAsync({
       organizationId: req.organization!.id,
       name: String(name).trim(),
       code: String(code).trim().toUpperCase(),
@@ -367,14 +366,14 @@ academicRouter.post('/subjects', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (re
   }
 });
 
-academicRouter.put('/subjects/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/subjects/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getSubjectById(req.params.id, req.organization!.id);
+    const existing = await db.getSubjectByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المادة غير موجودة' });
     }
     const { name, code, color, description } = req.body;
-    const updated = db.updateSubject(req.params.id, req.organization!.id, {
+    const updated = await db.updateSubjectAsync(req.params.id, req.organization!.id, {
       name: name ? String(name).trim() : undefined,
       code: code ? String(code).trim().toUpperCase() : undefined,
       color,
@@ -386,9 +385,9 @@ academicRouter.put('/subjects/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
   }
 });
 
-academicRouter.delete('/subjects/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/subjects/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteSubject(req.params.id, req.organization!.id);
+    const success = await db.deleteSubjectAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'المادة غير موجودة' });
     }
@@ -520,7 +519,7 @@ academicRouter.delete('/teacher-assignments/:id', requireRoles(['ORG_ADMIN', 'SU
 // 7. Student Enrollments
 // ==========================================
 
-academicRouter.get('/enrollments', (req: PlatformRequest, res: express.Response) => {
+academicRouter.get('/enrollments', async (req: PlatformRequest, res: express.Response) => {
   try {
     const { role, id: userId, classroomId: userClassroomId } = req.user!;
     const orgId = req.organization!.id;
@@ -540,7 +539,7 @@ academicRouter.get('/enrollments', (req: PlatformRequest, res: express.Response)
       }
     }
 
-    const enrollments = db.getStudentEnrollments(orgId, {
+    const enrollments = await db.getStudentEnrollmentsAsync(orgId, {
       classroomId: filterClassroom,
       studentId: filterStudent,
       academicYearId,
@@ -553,7 +552,7 @@ academicRouter.get('/enrollments', (req: PlatformRequest, res: express.Response)
   }
 });
 
-academicRouter.post('/enrollments', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.post('/enrollments', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { studentId, classroomId, academicYearId, rollNumber, status } = req.body;
     if (!studentId || !classroomId || !academicYearId) {
@@ -565,19 +564,20 @@ academicRouter.post('/enrollments', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
     }
 
     const orgId = req.organization!.id;
-    const student = db.getUserById(studentId, orgId);
+    const student = await db.getUserByIdAsync(studentId, orgId);
     if (!student || student.role !== 'STUDENT') {
       return res.status(400).json({ success: false, error: 'INVALID_STUDENT', message: 'الطالب غير موجود أو نوع الحساب غير صحيح' });
     }
     if (!db.isClassroomInOrg(classroomId, orgId)) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة الدراسية غير صالحة' });
     }
-    if (!db.isAcademicYearInOrg(academicYearId, orgId)) {
-      return res.status(400).json({ success: false, error: 'INVALID_YEAR', message: 'السنة الأكاديمية غير صالحة' });
+      const yearExists = await db.getAcademicYearByIdAsync(academicYearId, orgId);
+      if (!yearExists) {
+        return res.status(400).json({ success: false, error: 'INVALID_YEAR', message: 'السنة الأكاديمية غير صالحة' });
     }
 
     // Check duplicate active enrollment for this student in the same year
-    const existing = db.getStudentEnrollments(orgId, { studentId, academicYearId });
+    const existing = await db.getStudentEnrollmentsAsync(orgId, { studentId, academicYearId });
     if (existing.length > 0) {
       return res.status(409).json({
         success: false,
@@ -587,7 +587,7 @@ academicRouter.post('/enrollments', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
       });
     }
 
-    const enrollment = db.createStudentEnrollment({
+    const enrollment = await db.createStudentEnrollmentAsync({
       organizationId: orgId,
       studentId,
       classroomId,
@@ -602,9 +602,9 @@ academicRouter.post('/enrollments', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), 
   }
 });
 
-academicRouter.put('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.put('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const existing = db.getStudentEnrollmentById(req.params.id, req.organization!.id);
+    const existing = await db.getStudentEnrollmentByIdAsync(req.params.id, req.organization!.id);
     if (!existing) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'تسجيل الطالب غير موجود' });
     }
@@ -612,11 +612,11 @@ academicRouter.put('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']
     const { classroomId, rollNumber, status } = req.body;
     const orgId = req.organization!.id;
 
-    if (classroomId && !db.isClassroomInOrg(classroomId, orgId)) {
+    if (classroomId && !(await db.getClassroomByIdAsync(classroomId, orgId))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة غير صالحة' });
     }
 
-    const updated = db.updateStudentEnrollment(req.params.id, orgId, {
+    const updated = await db.updateStudentEnrollmentAsync(req.params.id, orgId, {
       classroomId,
       rollNumber: rollNumber !== undefined ? String(rollNumber).trim() : undefined,
       status,
@@ -628,9 +628,9 @@ academicRouter.put('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']
   }
 });
 
-academicRouter.delete('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+academicRouter.delete('/enrollments/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
-    const success = db.deleteStudentEnrollment(req.params.id, req.organization!.id);
+    const success = await db.deleteStudentEnrollmentAsync(req.params.id, req.organization!.id);
     if (!success) {
       return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'تسجيل الطالب غير موجود' });
     }

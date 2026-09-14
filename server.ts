@@ -1,12 +1,21 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { platformApiRouter } from './server/platform/index.ts';
 import { assertProductionPostgres } from './src/db/postgres.ts';
 import { assertProductionAuthSecret } from './server/platform/auth.ts';
+import { runMigrations } from './src/db/migrate.ts';
+import { db } from './server/platform/db.ts';
 
 export async function createApp() {
   assertProductionAuthSecret();
+  if (process.env.NODE_ENV === 'production') {
+    const migrationResult = await runMigrations();
+    if (!migrationResult.success) {
+      throw new Error(`[FATAL MIGRATION ERROR] ${migrationResult.message}`);
+    }
+    await assertProductionPostgres();
+    await db.initializeFromPostgres();
+  }
   const app = express();
 
   // SEC-01: HTTP Security Headers
@@ -323,7 +332,6 @@ export async function createApp() {
 }
 
 export async function startServer() {
-  await assertProductionPostgres();
   const app = await createApp();
   const PORT = 3000;
 
@@ -351,8 +359,7 @@ export async function startServer() {
 }
 
 const isDirectRun = Boolean(
-  process.argv.some((arg) => arg.includes('server.ts') || arg.includes('server.cjs') || arg.includes('server.js')) ||
-  (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]))
+  process.argv.some((arg) => arg.includes('server.ts') || arg.includes('server.cjs') || arg.includes('server.js'))
 );
 
 if (isDirectRun && process.env.NODE_ENV !== 'test') {

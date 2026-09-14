@@ -12,8 +12,11 @@ export async function runMigrations(): Promise<{
   tablesCount?: number;
   appliedMigrations?: string[];
 }> {
-  const runMigrationsFlag = process.env.RUN_MIGRATIONS === 'true';
-  const directUrl = process.env.DIRECT_DATABASE_URL;
+  const isProduction = process.env.NODE_ENV === 'production';
+  const runMigrationsFlag = isProduction || process.env.RUN_MIGRATIONS === 'true';
+  const directUrl = process.env.DIRECT_DATABASE_URL || (
+    !isProduction ? process.env.DATABASE_URL : undefined
+  );
 
   // 1. Explicit Migration Execution Flag
   if (!runMigrationsFlag) {
@@ -27,7 +30,7 @@ export async function runMigrations(): Promise<{
   if (!directUrl) {
     return {
       success: false,
-      message: `Cannot run migrations: RUN_MIGRATIONS is true but DIRECT_DATABASE_URL is missing. Migrations require a direct database connection.`,
+      message: `Cannot run migrations: production startup requires DIRECT_DATABASE_URL. RUN_MIGRATIONS=true outside production may use DATABASE_URL. Migrations require a direct database connection.`,
     };
   }
 

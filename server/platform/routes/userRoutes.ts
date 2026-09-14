@@ -12,13 +12,13 @@ userRouter.use(requireAuth);
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // GET /api/v1/users (Filter by role, classroom, search)
-userRouter.get('/', (req: PlatformRequest, res: express.Response) => {
+userRouter.get('/', async (req: PlatformRequest, res: express.Response) => {
   try {
     const role = req.query.role as UserRole | undefined;
     const classroomId = req.query.classroomId as string | undefined;
     const search = (req.query.search as string | undefined)?.toLowerCase().trim();
 
-    let users = db.getUsersByOrg(req.organization!.id, role);
+    let users = await db.getUsersByOrgAsync(req.organization!.id, role);
 
     if (classroomId) {
       users = users.filter((u) => u.classroomId === classroomId);
@@ -55,7 +55,7 @@ userRouter.get('/', (req: PlatformRequest, res: express.Response) => {
 });
 
 // POST /api/v1/users (Create teacher / student / admin)
-userRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+userRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { email, fullName, role, phone, studentIdNumber, teacherSpecialization, classroomId } = req.body;
 
@@ -74,16 +74,16 @@ userRouter.post('/', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformR
     }
 
     // Verify classroom if provided
-    if (classroomId && !db.isClassroomInOrg(classroomId, req.organization!.id)) {
+    if (classroomId && !(await db.isClassroomInOrgAsync(classroomId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة الدراسية غير موجودة في المؤسسة' });
     }
 
-    const existing = db.findUserByEmail(normalizedEmail, req.organization!.id);
+    const existing = await db.findUserByEmailAsync(normalizedEmail, req.organization!.id);
     if (existing) {
       return res.status(400).json({ success: false, error: 'EMAIL_EXISTS', message: 'البريد الإلكتروني مسجل مسبقاً في هذه المؤسسة' });
     }
 
-    const user = db.createUser({
+    const user = await db.createUserAsync({
       organizationId: req.organization!.id,
       email: normalizedEmail,
       fullName: sanitizeString(fullName),
@@ -126,7 +126,7 @@ function parseCsvRows(csvContent: string) {
 userRouter.post(
   '/import-csv/preview',
   requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']),
-  (req: PlatformRequest, res: express.Response) => {
+  async (req: PlatformRequest, res: express.Response) => {
     try {
       const { csvContent, targetRole = 'STUDENT', targetClassroomId } = req.body;
       if (!csvContent || typeof csvContent !== 'string') {
@@ -152,7 +152,7 @@ userRouter.post(
       let validCount = 0;
       let errorCount = 0;
 
-      rows.forEach((line, index) => {
+      for (const [index, line] of rows.entries()) {
         const cols = line.split(/[,;\t]/).map((c) => c.trim().replace(/^["']|["']$/g, ''));
         const name = cols[0] || '';
         const rawEmail = cols[1] || '';
@@ -173,7 +173,7 @@ userRouter.post(
             isValid: false,
             errorMessage: 'الاسم والبريد الإلكتروني حقلان إلزاميان',
           });
-          return;
+          continue;
         }
 
         if (!EMAIL_REGEX.test(email)) {
@@ -187,7 +187,7 @@ userRouter.post(
             isValid: false,
             errorMessage: 'صيغة البريد الإلكتروني غير صالحة',
           });
-          return;
+          continue;
         }
 
         if (seenEmailsInFile.has(email)) {
@@ -201,11 +201,11 @@ userRouter.post(
             isValid: false,
             errorMessage: 'البريد الإلكتروني مكرر في الملف',
           });
-          return;
+          continue;
         }
         seenEmailsInFile.add(email);
 
-        if (db.findUserByEmail(email, req.organization!.id)) {
+        if (await db.findUserByEmailAsync(email, req.organization!.id)) {
           errorCount++;
           previewRows.push({
             row: rowNum,
@@ -216,7 +216,7 @@ userRouter.post(
             isValid: false,
             errorMessage: 'البريد مسجل بالفعل في هذه المدرسة',
           });
-          return;
+          continue;
         }
 
         validCount++;
@@ -228,7 +228,7 @@ userRouter.post(
           phone,
           isValid: true,
         });
-      });
+      }
 
       return res.json({
         success: true,
@@ -248,14 +248,14 @@ userRouter.post(
 );
 
 // POST /api/v1/users/import-csv (Bulk Import Students / Teachers)
-userRouter.post('/import-csv', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+userRouter.post('/import-csv', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { csvContent, targetClassroomId, targetRole = 'STUDENT' } = req.body;
     if (!csvContent || typeof csvContent !== 'string') {
       return res.status(400).json({ success: false, error: 'NO_CSV_DATA', message: 'يرجى إرسال بيانات ملف CSV' });
     }
 
-    if (targetClassroomId && !db.isClassroomInOrg(targetClassroomId, req.organization!.id)) {
+    if (targetClassroomId && !(await db.isClassroomInOrgAsync(targetClassroomId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة المحددة غير موجودة في المؤسسة' });
     }
 
@@ -268,39 +268,39 @@ userRouter.post('/import-csv', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req:
     const errors: { row: number; reason: string }[] = [];
     const seenEmailsInFile = new Set<string>();
 
-    rows.forEach((line, index) => {
+    for (const [index, line] of rows.entries()) {
       const cols = line.split(/[,;\t]/).map((c) => c.trim().replace(/^["']|["']$/g, ''));
       if (cols.length < 2) {
         errors.push({ row: index + 2, reason: 'تنسيق الصف غير صالح' });
-        return;
+        continue;
       }
 
       const [name, rawEmail, customIdentifier, phone] = cols;
       if (!name || !rawEmail) {
         errors.push({ row: index + 2, reason: 'الاسم أو البريد مفقود' });
-        return;
+        continue;
       }
 
       const email = rawEmail.toLowerCase().trim();
       if (!EMAIL_REGEX.test(email)) {
         errors.push({ row: index + 2, reason: `صيغة البريد الإلكتروني (${email}) غير صالحة` });
-        return;
+        continue;
       }
 
       if (seenEmailsInFile.has(email)) {
         errors.push({ row: index + 2, reason: `البريد (${email}) مكرر في الملف نفسه` });
-        return;
+        continue;
       }
       seenEmailsInFile.add(email);
 
-      if (db.findUserByEmail(email, req.organization!.id)) {
+      if (await db.findUserByEmailAsync(email, req.organization!.id)) {
         errors.push({ row: index + 2, reason: `البريد (${email}) موجود مسبقاً في قاعدة البيانات` });
-        return;
+        continue;
       }
 
       const role: UserRole = targetRole === 'TEACHER' ? 'TEACHER' : 'STUDENT';
 
-      const user = db.createUser({
+      const user = await db.createUserAsync({
         organizationId: req.organization!.id,
         email,
         fullName: name.trim(),
@@ -316,7 +316,7 @@ userRouter.post('/import-csv', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req:
         isActive: true,
       });
       imported.push(user);
-    });
+    }
 
     db.logAction(
       req.organization!.id,
@@ -345,12 +345,12 @@ userRouter.post('/import-csv', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req:
 });
 
 // PUT /api/v1/users/:id
-userRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+userRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { id } = req.params;
     const { email, fullName, role, phone, studentIdNumber, teacherSpecialization, classroomId, isActive } = req.body;
 
-    const existingUser = db.getUserById(id, req.organization!.id);
+    const existingUser = await db.getUserByIdAsync(id, req.organization!.id);
     if (!existingUser) {
       return res.status(404).json({ success: false, error: 'USER_NOT_FOUND', message: 'المستخدم غير موجود في هذه المؤسسة' });
     }
@@ -359,7 +359,7 @@ userRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: Platfor
       return res.status(400).json({ success: false, error: 'CANNOT_DEACTIVATE_SELF', message: 'لا يمكنك تعطيل حسابك الخاص' });
     }
 
-    if (classroomId && !db.isClassroomInOrg(classroomId, req.organization!.id)) {
+    if (classroomId && !(await db.isClassroomInOrgAsync(classroomId, req.organization!.id))) {
       return res.status(400).json({ success: false, error: 'INVALID_CLASSROOM', message: 'الشعبة الدراسية غير صالحة' });
     }
 
@@ -374,7 +374,13 @@ userRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: Platfor
       updates.role = role as UserRole;
     }
 
-    const updated = db.updateUser(id, req.organization!.id, updates);
+    const updated = await db.updateUserAsync(id, req.organization!.id, updates);
+    if (updated && updates.role) {
+      const membership = await db.getMembershipAsync(id, req.organization!.id);
+      if (membership) {
+        await db.updateMembershipAsync(membership.id, req.organization!.id, { role: updates.role });
+      }
+    }
     db.logAction(req.organization!.id, req.user!.id, req.user!.email, 'UPDATE_USER', 'User', id, { updates }, req.ip);
 
     res.json({ success: true, data: updated });
@@ -384,14 +390,14 @@ userRouter.put('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: Platfor
 });
 
 // DELETE /api/v1/users/:id
-userRouter.delete('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), (req: PlatformRequest, res: express.Response) => {
+userRouter.delete('/:id', requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']), async (req: PlatformRequest, res: express.Response) => {
   try {
     const { id } = req.params;
     if (id === req.user!.id) {
       return res.status(400).json({ success: false, error: 'CANNOT_DELETE_SELF', message: 'لا يمكنك حذف حسابك الخاص' });
     }
 
-    const deleted = db.deleteUser(id, req.organization!.id);
+    const deleted = await db.deleteUserAsync(id, req.organization!.id);
     if (!deleted) {
       return res.status(404).json({ success: false, error: 'USER_NOT_FOUND', message: 'المستخدم غير موجود في هذه المؤسسة' });
     }

@@ -140,8 +140,23 @@ export const platformAuthMiddleware = (
   res: express.Response,
   next: express.NextFunction
 ) => {
+  void resolvePlatformAuth(req, res, next).catch(next);
+};
+
+const resolvePlatformAuth = async (
+  req: PlatformRequest,
+  res: express.Response,
+  next: express.NextFunction
+) => {
   const authHeader = req.headers.authorization;
   const tenantHeader = (req.headers['x-tenant-id'] || req.headers['x-tenant-slug']) as string;
+
+  // Public endpoints must not resolve a memory or database tenant before their own guard runs.
+  // This also lets production-only endpoints such as demo-switch return their explicit 403.
+  if (process.env.NODE_ENV === 'production' && !authHeader) {
+    next();
+    return;
+  }
 
   // 1. If Bearer token provided
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -150,7 +165,7 @@ export const platformAuthMiddleware = (
 
     if (verified) {
       // 1. Identify user strictly by verified.uid (Universal Identity)
-      const baseUser = db.getUserById(verified.uid);
+      const baseUser = await db.getUserByIdAsync(verified.uid);
       if (baseUser && baseUser.isActive) {
         // If the context is explicitly PERSONAL (or no oid/mid provided):
         if (verified.ctx === 'PERSONAL' || (!verified.oid && !verified.mid)) {
@@ -172,7 +187,7 @@ export const platformAuthMiddleware = (
         // If a specific membershipId was provided in the token:
         let activeMembership: OrganizationMembership | undefined;
         if (verified.mid) {
-          const m = db.getMembershipById(verified.mid);
+          const m = await db.getMembershipByIdAsync(verified.mid);
           if (m && m.userId === baseUser.id && m.status === 'ACTIVE') {
             activeMembership = m;
           }
@@ -180,7 +195,7 @@ export const platformAuthMiddleware = (
 
         // Lookup active membership by (userId, oid)
         if (!activeMembership && verified.oid) {
-          const m = db.getMembership(baseUser.id, verified.oid);
+          const m = await db.getMembershipAsync(baseUser.id, verified.oid);
           if (m && m.status === 'ACTIVE') {
             activeMembership = m;
           }
@@ -188,7 +203,7 @@ export const platformAuthMiddleware = (
 
         // If active membership found for this organization
         if (activeMembership) {
-          const org = db.getOrganizationById(activeMembership.organizationId);
+          const org = await db.getOrganizationByIdAsync(activeMembership.organizationId);
           if (org && org.isActive) {
             req.organization = org;
             req.membership = activeMembership;
@@ -216,7 +231,7 @@ export const platformAuthMiddleware = (
 
         // Special handling for SUPER_ADMIN when operating on any organization
         if (baseUser.role === 'SUPER_ADMIN' && verified.oid) {
-          const org = db.getOrganizationById(verified.oid);
+          const org = await db.getOrganizationByIdAsync(verified.oid);
           if (org && org.isActive) {
             req.organization = org;
             req.user = {
@@ -255,7 +270,7 @@ export const platformAuthMiddleware = (
 
   // 2. Unauthenticated request: Resolve tenant from header if supplied
   if (tenantHeader) {
-    const org = db.getOrganizationById(tenantHeader) || db.getOrganizationBySlug(tenantHeader);
+    const org = await db.getOrganizationByIdAsync(tenantHeader) || await db.getOrganizationBySlugAsync(tenantHeader);
     if (org) {
       req.organization = org;
     }
@@ -263,7 +278,7 @@ export const platformAuthMiddleware = (
 
   // Default fallback for unauthenticated public preview landing
   if (!req.organization) {
-    req.organization = db.getOrganizationBySlug('horizon');
+    req.organization = await db.getOrganizationBySlugAsync('horizon');
   }
 
   next();

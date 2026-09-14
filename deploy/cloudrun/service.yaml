@@ -76,6 +76,11 @@ spec:
                 secretKeyRef:
                   name: rtiqa-database-url
                   key: latest
+            - name: DIRECT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: rtiqa-direct-database-url
+                  key: latest
             - name: AUTH_SECRET
               valueFrom:
                 secretKeyRef:

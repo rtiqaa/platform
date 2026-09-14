@@ -66,7 +66,7 @@ import type {
   LibraryResourceStatus,
   ResourceActivityAction,
 } from './types.ts';
-import { checkPostgresConnection, getPostgresPool, withTenantClient } from '../../src/db/postgres.ts';
+import { checkPostgresConnection, getPostgresPool, queryGlobal, withTenantClient } from '../../src/db/postgres.ts';
 import type { PostgresStatus } from '../../src/db/postgres.ts';
 import { hashPassword } from './security.ts';
 
@@ -115,12 +115,572 @@ class PlatformDatabase {
   private resourceActivities: Map<string, ResourceActivity> = new Map();
 
   constructor() {
-    this.seedInitialData();
+    if (process.env.NODE_ENV !== 'production') {
+      this.seedInitialData();
+    }
   }
 
   // --- Engine Status Check ---
   async getEngineStatus(): Promise<PostgresStatus> {
     return checkPostgresConnection();
+  }
+
+  private mapOrganizationRow(row: any): Organization {
+    return {
+      id: row.id,
+      slug: row.slug,
+      name: row.name,
+      legalName: row.legal_name || undefined,
+      countryCode: row.country_code,
+      timezone: row.timezone,
+      locale: row.locale === 'en' ? 'en' : 'ar',
+      logoUrl: row.logo_url || undefined,
+      isActive: Boolean(row.is_active),
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+      updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at),
+    };
+  }
+
+  private mapUserRow(row: any): User {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      email: row.email,
+      passwordHash: row.password_hash || undefined,
+      fullName: row.full_name,
+      role: row.role,
+      avatarUrl: row.avatar_url || undefined,
+      phone: row.phone || undefined,
+      studentIdNumber: row.student_id_number || undefined,
+      teacherSpecialization: row.teacher_specialization || undefined,
+      classroomId: row.classroom_id || undefined,
+      emailVerified: Boolean(row.email_verified),
+      phoneVerified: Boolean(row.phone_verified),
+      authProviders: row.auth_providers || ['email'],
+      googleId: row.google_id || undefined,
+      isActive: Boolean(row.is_active),
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+      updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at),
+    };
+  }
+
+  private mapMembershipRow(row: any, organization?: Organization): OrganizationMembership {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      organizationId: row.organization_id,
+      role: row.role,
+      isDefault: Boolean(row.is_default),
+      status: row.status,
+      classroomId: row.classroom_id || undefined,
+      studentIdNumber: row.student_id_number || undefined,
+      teacherSpecialization: row.teacher_specialization || undefined,
+      organizationName: organization?.name,
+      organizationSlug: organization?.slug,
+      joinedAt: row.joined_at?.toISOString ? row.joined_at.toISOString() : String(row.joined_at),
+    };
+  }
+
+  private async getProductionOrganizationIds(): Promise<string[]> {
+    const result = await queryGlobal<{ id: string }>(
+      'SELECT id FROM organizations WHERE is_active = TRUE ORDER BY id'
+    );
+    return result.rows.map((row) => row.id);
+  }
+
+  private async withIdentityTenant<T>(organizationId: string, callback: (client: any) => Promise<T>): Promise<T> {
+    if (!organizationId) throw new Error('TENANT_REQUIRED');
+    return withTenantClient(organizationId, callback);
+  }
+
+  async getOrganizationByIdAsync(organizationId: string): Promise<Organization | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getOrganizationById(organizationId);
+    const result = await queryGlobal(
+      `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations WHERE id = $1 AND is_active = TRUE`,
+      [organizationId]
+    );
+    return result.rows[0] ? this.mapOrganizationRow(result.rows[0]) : undefined;
+  }
+
+  async getOrganizationBySlugAsync(slug: string): Promise<Organization | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getOrganizationBySlug(slug);
+    const result = await queryGlobal(
+      `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations WHERE (slug = $1 OR id = $1) AND is_active = TRUE`,
+      [slug]
+    );
+    return result.rows[0] ? this.mapOrganizationRow(result.rows[0]) : undefined;
+  }
+
+  async getUsersByOrgAsync(organizationId: string, role?: string): Promise<User[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getUsersByOrg(organizationId, role);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                phone, student_id_number, teacher_specialization, classroom_id,
+                email_verified, phone_verified, auth_providers, google_id, is_active,
+                created_at, updated_at
+         FROM users
+         WHERE organization_id = $1 AND ($2::text IS NULL OR role = $2)
+         ORDER BY full_name, id`,
+        [organizationId, role || null]
+      );
+      return result.rows.map((row: any) => this.mapUserRow(row));
+    });
+  }
+
+  async isClassroomInOrgAsync(classroomId: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.isClassroomInOrg(classroomId, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        'SELECT 1 FROM classrooms WHERE id = $1 AND organization_id = $2 LIMIT 1',
+        [classroomId, organizationId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
+  async getUserByIdAsync(userId: string, organizationId?: string): Promise<User | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getUserById(userId, organizationId);
+    const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+    for (const currentOrganizationId of organizationIds) {
+      const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE id = $1 AND organization_id = $2`,
+          [userId, currentOrganizationId]
+        );
+        return result.rows[0] ? this.mapUserRow(result.rows[0]) : undefined;
+      });
+      if (user) return user;
+    }
+    return undefined;
+  }
+
+  async findUserByEmailAsync(email: string, organizationId?: string): Promise<User | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.findUserByEmail(email, organizationId);
+    const normalized = email.trim().toLowerCase();
+    const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+    for (const currentOrganizationId of organizationIds) {
+      const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE lower(email) = $1 AND organization_id = $2`,
+          [normalized, currentOrganizationId]
+        );
+        return result.rows[0] ? this.mapUserRow(result.rows[0]) : undefined;
+      });
+      if (user) return user;
+    }
+    return undefined;
+  }
+
+  async findUserByPhoneAsync(phone: string, organizationId?: string): Promise<User | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.findUserByPhone(phone, organizationId);
+    const organizationIds = organizationId ? [organizationId] : await this.getProductionOrganizationIds();
+    for (const currentOrganizationId of organizationIds) {
+      const user = await this.withIdentityTenant(currentOrganizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE phone = $1 AND organization_id = $2`,
+          [phone.trim(), currentOrganizationId]
+        );
+        return result.rows[0] ? this.mapUserRow(result.rows[0]) : undefined;
+      });
+      if (user) return user;
+    }
+    return undefined;
+  }
+
+  async findUserByGoogleIdAsync(googleId: string): Promise<User | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.findUserByGoogleId(googleId);
+    const organizationIds = await this.getProductionOrganizationIds();
+    for (const organizationId of organizationIds) {
+      const user = await this.withIdentityTenant(organizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                  phone, student_id_number, teacher_specialization, classroom_id,
+                  email_verified, phone_verified, auth_providers, google_id, is_active,
+                  created_at, updated_at
+           FROM users WHERE google_id = $1 AND organization_id = $2`,
+          [googleId.trim(), organizationId]
+        );
+        return result.rows[0] ? this.mapUserRow(result.rows[0]) : undefined;
+      });
+      if (user) return user;
+    }
+    return undefined;
+  }
+
+  async getMembershipsByUserIdAsync(userId: string): Promise<OrganizationMembership[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getMembershipsByUserId(userId);
+    const memberships: OrganizationMembership[] = [];
+    for (const organizationId of await this.getProductionOrganizationIds()) {
+      const organization = await this.getOrganizationByIdAsync(organizationId);
+      const rows = await this.withIdentityTenant(organizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                  student_id_number, teacher_specialization, joined_at
+           FROM organization_memberships
+           WHERE user_id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+          [userId, organizationId]
+        );
+        return result.rows;
+      });
+      memberships.push(...rows.map((row: any) => this.mapMembershipRow(row, organization)));
+    }
+    return memberships;
+  }
+
+  async getMembershipByIdAsync(membershipId: string): Promise<OrganizationMembership | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getMembershipById(membershipId);
+    for (const organizationId of await this.getProductionOrganizationIds()) {
+      const organization = await this.getOrganizationByIdAsync(organizationId);
+      const membership = await this.withIdentityTenant(organizationId, async (client) => {
+        const result = await client.query(
+          `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                  student_id_number, teacher_specialization, joined_at
+           FROM organization_memberships
+           WHERE id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+          [membershipId, organizationId]
+        );
+        return result.rows[0] ? this.mapMembershipRow(result.rows[0], organization) : undefined;
+      });
+      if (membership) return membership;
+    }
+    return undefined;
+  }
+
+  async getMembershipAsync(userId: string, organizationId: string): Promise<OrganizationMembership | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getMembership(userId, organizationId);
+    const organization = await this.getOrganizationByIdAsync(organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                student_id_number, teacher_specialization, joined_at
+         FROM organization_memberships
+         WHERE user_id = $1 AND organization_id = $2 AND status <> 'REVOKED'`,
+        [userId, organizationId]
+      );
+      return result.rows[0] ? this.mapMembershipRow(result.rows[0], organization) : undefined;
+    });
+  }
+
+  async createOrganizationAsync(data: Omit<Organization, 'id' | 'createdAt' | 'updatedAt'>): Promise<Organization> {
+    if (process.env.NODE_ENV !== 'production') return this.createOrganization(data);
+    const id = generateId('org');
+    const now = new Date();
+    const result = await queryGlobal(
+      `INSERT INTO organizations (
+         id, slug, name, legal_name, country_code, timezone, locale, logo_url, is_active, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+       RETURNING id, slug, name, legal_name, country_code, timezone, locale, logo_url, is_active, created_at, updated_at`,
+      [id, data.slug, data.name, data.legalName || null, data.countryCode, data.timezone, data.locale, data.logoUrl || null, data.isActive, now]
+    );
+    return this.mapOrganizationRow(result.rows[0]);
+  }
+
+  async createUserAsync(data: Omit<User, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }): Promise<User> {
+    if (process.env.NODE_ENV !== 'production') return this.createUser(data);
+    if (!data.organizationId) throw new Error('TENANT_REQUIRED');
+    const id = data.id || generateId('usr');
+    const now = new Date();
+    const user = await this.withIdentityTenant(data.organizationId, async (client) => {
+      await client.query('BEGIN');
+      try {
+        const result = await client.query(
+          `INSERT INTO users (
+             id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+             student_id_number, teacher_specialization, classroom_id, email_verified,
+             phone_verified, auth_providers, google_id, is_active, created_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+           RETURNING id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+                     student_id_number, teacher_specialization, classroom_id, email_verified,
+                     phone_verified, auth_providers, google_id, is_active, created_at, updated_at`,
+          [
+            id,
+            data.organizationId,
+            data.email.trim().toLowerCase(),
+            data.passwordHash || null,
+            data.fullName,
+            data.role,
+            data.avatarUrl || null,
+            data.phone || null,
+            data.studentIdNumber || null,
+            data.teacherSpecialization || null,
+            data.classroomId || null,
+            data.emailVerified ?? false,
+            data.phoneVerified ?? false,
+            JSON.stringify(data.authProviders || ['email']),
+            data.googleId || null,
+            data.isActive,
+            now,
+          ]
+        );
+        const membershipId = generateId('mem');
+        await client.query(
+          `INSERT INTO organization_memberships (
+             id, user_id, organization_id, role, is_default, status, classroom_id,
+             student_id_number, teacher_specialization, joined_at
+           ) VALUES ($1, $2, $3, $4, TRUE, 'ACTIVE', $5, $6, $7, $8)`,
+          [membershipId, id, data.organizationId, data.role, data.classroomId || null, data.studentIdNumber || null, data.teacherSpecialization || null, now]
+        );
+        await client.query('COMMIT');
+        return this.mapUserRow(result.rows[0]);
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      }
+    });
+    return user;
+  }
+
+  async updateUserAsync(id: string, organizationId: string, updates: Partial<User>): Promise<User | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateUser(id, organizationId, updates);
+    const allowed: Array<[string, unknown]> = [
+      ['email', updates.email?.trim().toLowerCase()],
+      ['password_hash', updates.passwordHash],
+      ['full_name', updates.fullName],
+      ['role', updates.role],
+      ['avatar_url', updates.avatarUrl],
+      ['phone', updates.phone],
+      ['student_id_number', updates.studentIdNumber],
+      ['teacher_specialization', updates.teacherSpecialization],
+      ['classroom_id', updates.classroomId],
+      ['email_verified', updates.emailVerified],
+      ['phone_verified', updates.phoneVerified],
+      ['auth_providers', updates.authProviders ? JSON.stringify(updates.authProviders) : undefined],
+      ['google_id', updates.googleId],
+      ['is_active', updates.isActive],
+    ].filter(([, value]) => value !== undefined) as Array<[string, unknown]>;
+    if (allowed.length === 0) return this.getUserByIdAsync(id, organizationId);
+
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const setClause = allowed.map(([column], index) => `${column} = $${index + 3}`).join(', ');
+      const values = allowed.map(([, value]) => value);
+      const result = await client.query(
+        `UPDATE users SET ${setClause}, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2
+         RETURNING id, organization_id, email, password_hash, full_name, role, avatar_url, phone,
+                   student_id_number, teacher_specialization, classroom_id, email_verified,
+                   phone_verified, auth_providers, google_id, is_active, created_at, updated_at`,
+        [id, organizationId, ...values]
+      );
+      return result.rows[0] ? this.mapUserRow(result.rows[0]) : undefined;
+    });
+  }
+
+  async unlinkAccountProviderAsync(
+    userId: string,
+    organizationId: string,
+    provider: AuthProviderType
+  ): Promise<{ success: boolean; user?: User; error?: string }> {
+    if (process.env.NODE_ENV !== 'production') return this.unlinkAccountProvider(userId, provider);
+    const user = await this.getUserByIdAsync(userId, organizationId);
+    if (!user) return { success: false, error: 'USER_NOT_FOUND' };
+    const providers = user.authProviders || ['email'];
+    if (providers.length <= 1) return { success: false, error: 'CANNOT_UNLINK_LAST_PROVIDER', user };
+    const updates: Partial<User> = {
+      authProviders: providers.filter((current) => current !== provider),
+    };
+    if (provider === 'google') updates.googleId = undefined;
+    if (provider === 'phone') {
+      updates.phone = undefined;
+      updates.phoneVerified = false;
+    }
+    if (provider === 'email') updates.emailVerified = false;
+    const updated = await this.updateUserAsync(userId, organizationId, updates);
+    return { success: true, user: updated };
+  }
+
+  async deleteUserAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteUser(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        'DELETE FROM users WHERE id = $1 AND organization_id = $2 RETURNING id',
+        [id, organizationId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
+  async addMembershipAsync(data: Omit<OrganizationMembership, 'id' | 'joinedAt'>): Promise<OrganizationMembership> {
+    if (process.env.NODE_ENV !== 'production') return this.addMembership(data);
+    const id = generateId('mem');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      const result = await client.query(
+        `INSERT INTO organization_memberships (
+           id, user_id, organization_id, role, is_default, status, classroom_id,
+           student_id_number, teacher_specialization, joined_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         RETURNING id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at`,
+        [id, data.userId, data.organizationId, data.role, data.isDefault, data.status, data.classroomId || null, data.studentIdNumber || null, data.teacherSpecialization || null]
+      );
+      const organization = await this.getOrganizationByIdAsync(data.organizationId);
+      return this.mapMembershipRow(result.rows[0], organization);
+    });
+  }
+
+  async updateMembershipAsync(
+    id: string,
+    organizationId: string,
+    updates: Partial<OrganizationMembership>
+  ): Promise<OrganizationMembership | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateMembership(id, updates);
+    const allowed: Array<[string, unknown]> = [
+      ['role', updates.role],
+      ['is_default', updates.isDefault],
+      ['status', updates.status],
+      ['classroom_id', updates.classroomId],
+      ['student_id_number', updates.studentIdNumber],
+      ['teacher_specialization', updates.teacherSpecialization],
+    ].filter(([, value]) => value !== undefined) as Array<[string, unknown]>;
+    if (allowed.length === 0) return this.getMembershipByIdAsync(id);
+
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const setClause = allowed.map(([column], index) => `${column} = $${index + 3}`).join(', ');
+      const values = allowed.map(([, value]) => value);
+      const result = await client.query(
+        `UPDATE organization_memberships SET ${setClause}
+         WHERE id = $1 AND organization_id = $2
+         RETURNING id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at`,
+        [id, organizationId, ...values]
+      );
+      if (!result.rows[0]) return undefined;
+      const organization = await this.getOrganizationByIdAsync(organizationId);
+      return this.mapMembershipRow(result.rows[0], organization);
+    });
+  }
+
+  async removeMembershipAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.removeMembership(id);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `UPDATE organization_memberships SET status = 'REVOKED'
+         WHERE id = $1 AND organization_id = $2 AND status <> 'REVOKED'
+         RETURNING id`,
+        [id, organizationId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
+  /** Loads identity and tenant context from PostgreSQL for the production process. */
+  async initializeFromPostgres(): Promise<void> {
+    if (process.env.NODE_ENV !== 'production') return;
+
+    const status = await checkPostgresConnection();
+    if (!status.connected) {
+      throw new Error('POSTGRES_REQUIRED_FOR_PRODUCTION_DATA');
+    }
+
+    const organizationResult = await queryGlobal<{
+      id: string;
+      slug: string;
+      name: string;
+      legal_name: string | null;
+      country_code: string;
+      timezone: string;
+      locale: string;
+      logo_url: string | null;
+      is_active: boolean;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `SELECT id, slug, name, legal_name, country_code, timezone, locale, logo_url,
+              is_active, created_at, updated_at
+       FROM organizations
+       WHERE is_active = TRUE
+       ORDER BY id`
+    );
+
+    for (const row of organizationResult.rows) {
+      const organization: Organization = {
+        id: row.id,
+        slug: row.slug,
+        name: row.name,
+        legalName: row.legal_name || undefined,
+        countryCode: row.country_code,
+        timezone: row.timezone,
+        locale: row.locale === 'en' ? 'en' : 'ar',
+        logoUrl: row.logo_url || undefined,
+        isActive: row.is_active,
+        createdAt: row.created_at.toISOString(),
+        updatedAt: row.updated_at.toISOString(),
+      };
+      this.organizations.set(organization.id, organization);
+
+      await withTenantClient(organization.id, async (client) => {
+        const [usersResult, membershipsResult] = await Promise.all([
+          client.query(`
+            SELECT id, organization_id, email, password_hash, full_name, role, avatar_url,
+                   phone, student_id_number, teacher_specialization, classroom_id,
+                   email_verified, phone_verified, auth_providers, google_id, is_active,
+                   created_at, updated_at
+            FROM users
+            WHERE organization_id = $1 AND is_active = TRUE`, [organization.id]),
+          client.query(`
+            SELECT id, user_id, organization_id, role, is_default, status, classroom_id,
+                   student_id_number, teacher_specialization, joined_at
+            FROM organization_memberships
+            WHERE organization_id = $1 AND status <> 'REVOKED'`, [organization.id]),
+        ]);
+
+        for (const row of usersResult.rows) {
+          const user: User = {
+            id: row.id,
+            organizationId: row.organization_id,
+            email: row.email,
+            passwordHash: row.password_hash || undefined,
+            fullName: row.full_name,
+            role: row.role,
+            avatarUrl: row.avatar_url || undefined,
+            phone: row.phone || undefined,
+            studentIdNumber: row.student_id_number || undefined,
+            teacherSpecialization: row.teacher_specialization || undefined,
+            classroomId: row.classroom_id || undefined,
+            emailVerified: row.email_verified,
+            phoneVerified: row.phone_verified,
+            authProviders: row.auth_providers || ['email'],
+            googleId: row.google_id || undefined,
+            isActive: row.is_active,
+            createdAt: row.created_at.toISOString(),
+            updatedAt: row.updated_at.toISOString(),
+          };
+          this.users.set(user.id, user);
+        }
+
+        for (const row of membershipsResult.rows) {
+          const membership: OrganizationMembership = {
+            id: row.id,
+            userId: row.user_id,
+            organizationId: row.organization_id,
+            role: row.role,
+            isDefault: row.is_default,
+            status: row.status,
+            classroomId: row.classroom_id || undefined,
+            studentIdNumber: row.student_id_number || undefined,
+            teacherSpecialization: row.teacher_specialization || undefined,
+            joinedAt: row.joined_at.toISOString(),
+          };
+          this.organizationMemberships.set(membership.id, membership);
+        }
+      });
+    }
   }
 
   // --- Seed realistic Multi-Tenant Data ---
@@ -2153,6 +2713,468 @@ class PlatformDatabase {
   }
 
   // Academic Structure
+  private toDateString(value: unknown): string {
+    return value instanceof Date ? value.toISOString().split('T')[0] : String(value);
+  }
+
+  private mapAcademicYearRow(row: any): AcademicYear {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      name: row.name,
+      startDate: this.toDateString(row.start_date),
+      endDate: this.toDateString(row.end_date),
+      isCurrent: Boolean(row.is_current),
+    };
+  }
+
+  private mapTermRow(row: any): Term {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      academicYearId: row.academic_year_id,
+      name: row.name,
+      startDate: this.toDateString(row.start_date),
+      endDate: this.toDateString(row.end_date),
+      isCurrent: Boolean(row.is_current),
+    };
+  }
+
+  private mapGradeLevelRow(row: any): GradeLevel {
+    return { id: row.id, organizationId: row.organization_id, name: row.name, sequenceOrder: Number(row.sequence_order) };
+  }
+
+  private mapClassroomRow(row: any): Classroom {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      gradeLevelId: row.grade_level_id,
+      name: row.name,
+      capacity: row.capacity === null ? undefined : Number(row.capacity),
+    };
+  }
+
+  private mapSubjectRow(row: any): Subject {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      name: row.name,
+      code: row.code,
+      color: row.color || undefined,
+      description: row.description || undefined,
+    };
+  }
+
+  private mapCourseRow(row: any): Course {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      subjectId: row.subject_id,
+      termId: row.term_id,
+      teacherId: row.teacher_id || undefined,
+      classroomId: row.classroom_id,
+      title: row.title,
+      description: row.description || undefined,
+      subjectName: row.subject_name || undefined,
+      teacherName: row.teacher_name || undefined,
+      classroomName: row.classroom_name || undefined,
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+    };
+  }
+
+  private mapEnrollmentRow(row: any): StudentEnrollment {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      studentId: row.student_id,
+      studentName: row.student_name || undefined,
+      studentEmail: row.student_email || undefined,
+      studentIdNumber: row.student_id_number || undefined,
+      classroomId: row.classroom_id,
+      classroomName: row.classroom_name || undefined,
+      gradeLevelId: row.grade_level_id || undefined,
+      gradeLevelName: row.grade_level_name || undefined,
+      academicYearId: row.academic_year_id,
+      academicYearName: row.academic_year_name || undefined,
+      rollNumber: row.roll_number || undefined,
+      status: row.status,
+      enrolledAt: row.enrolled_at?.toISOString ? row.enrolled_at.toISOString() : String(row.enrolled_at),
+      updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at),
+    };
+  }
+
+  private mapLessonRow(row: any): Lesson {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      courseId: row.course_id,
+      unitId: row.unit_id || undefined,
+      unitTitle: row.unit_title || undefined,
+      title: row.title,
+      contentHtml: row.content_html,
+      mediaUrl: row.media_url || undefined,
+      attachments: row.attachments || [],
+      resourceIds: row.resource_ids || [],
+      orderIndex: Number(row.order_index),
+      isPublished: Boolean(row.is_published),
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+      updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at),
+    };
+  }
+
+  private mapAssignmentRow(row: any): Assignment {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      courseId: row.course_id,
+      title: row.title,
+      description: row.description,
+      maxScore: Number(row.max_score),
+      dueDate: row.due_date?.toISOString ? row.due_date.toISOString() : String(row.due_date),
+      attachments: row.attachments || [],
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+    };
+  }
+
+  private mapTeacherAssignmentRow(row: any): TeacherAssignment {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      teacherId: row.teacher_id,
+      teacherName: row.teacher_name || undefined,
+      teacherEmail: row.teacher_email || undefined,
+      courseId: row.course_id || undefined,
+      courseTitle: row.course_title || undefined,
+      subjectId: row.subject_id,
+      subjectName: row.subject_name || undefined,
+      classroomId: row.classroom_id,
+      classroomName: row.classroom_name || undefined,
+      academicYearId: row.academic_year_id || undefined,
+      academicYearName: row.academic_year_name || undefined,
+      role: row.role,
+      weeklyHours: Number(row.weekly_hours),
+      status: row.status,
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+      updatedAt: row.updated_at?.toISOString ? row.updated_at.toISOString() : String(row.updated_at),
+    };
+  }
+
+  async getLessonsByCourseAsync(courseId: string, organizationId: string): Promise<Lesson[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getLessonsByCourse(courseId, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT l.id, l.organization_id, l.course_id, l.unit_id, cu.title AS unit_title,
+                l.title, l.content_html, l.media_url, l.attachments, l.resource_ids,
+                l.order_index, l.is_published, l.created_at, l.updated_at
+         FROM lessons l
+         LEFT JOIN curriculum_units cu ON cu.id = l.unit_id AND cu.organization_id = l.organization_id
+         WHERE l.organization_id = $1 AND l.course_id = $2
+         ORDER BY l.order_index, l.id`,
+        [organizationId, courseId]
+      );
+      return result.rows.map((row: any) => this.mapLessonRow(row));
+    });
+  }
+
+  async getAssignmentsByCourseAsync(courseId: string, organizationId: string): Promise<Assignment[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getAssignmentsByCourse(courseId, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT id, organization_id, course_id, title, description, max_score,
+                due_date, attachments, created_at
+         FROM assignments
+         WHERE organization_id = $1 AND course_id = $2
+         ORDER BY due_date, id`,
+        [organizationId, courseId]
+      );
+      return result.rows.map((row: any) => this.mapAssignmentRow(row));
+    });
+  }
+
+  async getCourseStudentsAsync(courseId: string, classroomId: string, organizationId: string): Promise<User[]> {
+    if (process.env.NODE_ENV !== 'production') {
+      return this.getStudentsByClassroom(classroomId, organizationId);
+    }
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT u.id, u.organization_id, u.email, u.password_hash, u.full_name, u.role,
+                u.avatar_url, u.phone, u.student_id_number, u.teacher_specialization,
+                u.classroom_id, u.email_verified, u.phone_verified, u.auth_providers,
+                u.google_id, u.is_active, u.created_at, u.updated_at
+         FROM student_enrollments e
+         JOIN users u ON u.id = e.student_id AND u.organization_id = e.organization_id
+         WHERE e.organization_id = $1 AND e.classroom_id = $2 AND e.status = 'ACTIVE'
+               AND EXISTS (SELECT 1 FROM courses c
+                           WHERE c.id = $3 AND c.organization_id = $1
+                             AND c.classroom_id = e.classroom_id)
+         ORDER BY u.full_name, u.id`,
+        [organizationId, classroomId, courseId]
+      );
+      return result.rows.map((row: any) => this.mapUserRow(row));
+    });
+  }
+
+  async getTeacherAssignmentsByCourseAsync(courseId: string, organizationId: string): Promise<TeacherAssignment[]> {
+    if (process.env.NODE_ENV !== 'production') {
+      return this.getTeacherAssignments(organizationId, { courseId });
+    }
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `SELECT ta.id, ta.organization_id, ta.teacher_id, u.full_name AS teacher_name,
+                u.email AS teacher_email, ta.course_id, c.title AS course_title,
+                ta.subject_id, s.name AS subject_name, ta.classroom_id,
+                cl.name AS classroom_name, ta.academic_year_id,
+                ay.name AS academic_year_name, ta.role, ta.weekly_hours, ta.status,
+                ta.created_at, ta.updated_at
+         FROM teacher_assignments ta
+         JOIN users u ON u.id = ta.teacher_id AND u.organization_id = ta.organization_id
+         JOIN subjects s ON s.id = ta.subject_id AND s.organization_id = ta.organization_id
+         JOIN classrooms cl ON cl.id = ta.classroom_id AND cl.organization_id = ta.organization_id
+         LEFT JOIN courses c ON c.id = ta.course_id AND c.organization_id = ta.organization_id
+         LEFT JOIN academic_years ay ON ay.id = ta.academic_year_id AND ay.organization_id = ta.organization_id
+         WHERE ta.organization_id = $1 AND ta.course_id = $2 AND ta.status = 'ACTIVE'
+         ORDER BY CASE WHEN ta.role = 'PRIMARY_TEACHER' THEN 0 ELSE 1 END, u.full_name, ta.id`,
+        [organizationId, courseId]
+      );
+      return result.rows.map((row: any) => this.mapTeacherAssignmentRow(row));
+    });
+  }
+
+  async getAcademicYearsAsync(organizationId: string): Promise<AcademicYear[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getAcademicYears(organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query('SELECT id, organization_id, name, start_date, end_date, is_current FROM academic_years WHERE organization_id = $1 ORDER BY start_date, id', [organizationId]);
+      return result.rows.map((row: any) => this.mapAcademicYearRow(row));
+    });
+  }
+
+  async getAcademicYearByIdAsync(id: string, organizationId: string): Promise<AcademicYear | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getAcademicYearById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query('SELECT id, organization_id, name, start_date, end_date, is_current FROM academic_years WHERE id = $1 AND organization_id = $2', [id, organizationId]);
+      return result.rows[0] ? this.mapAcademicYearRow(result.rows[0]) : undefined;
+    });
+  }
+
+  async createAcademicYearAsync(data: Omit<AcademicYear, 'id'>): Promise<AcademicYear> {
+    if (process.env.NODE_ENV !== 'production') return this.createAcademicYear(data);
+    const id = generateId('year');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      if (data.isCurrent) await client.query('UPDATE academic_years SET is_current = FALSE WHERE organization_id = $1', [data.organizationId]);
+      const result = await client.query('INSERT INTO academic_years (id, organization_id, name, start_date, end_date, is_current) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, organization_id, name, start_date, end_date, is_current', [id, data.organizationId, data.name, data.startDate, data.endDate, data.isCurrent]);
+      return this.mapAcademicYearRow(result.rows[0]);
+    });
+  }
+
+  async updateAcademicYearAsync(id: string, organizationId: string, updates: Partial<AcademicYear>): Promise<AcademicYear | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateAcademicYear(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      if (updates.isCurrent) await client.query('UPDATE academic_years SET is_current = FALSE WHERE organization_id = $1 AND id <> $2', [organizationId, id]);
+      const result = await client.query('UPDATE academic_years SET name = COALESCE($3, name), start_date = COALESCE($4, start_date), end_date = COALESCE($5, end_date), is_current = COALESCE($6, is_current) WHERE id = $1 AND organization_id = $2 RETURNING id, organization_id, name, start_date, end_date, is_current', [id, organizationId, updates.name ?? null, updates.startDate ?? null, updates.endDate ?? null, updates.isCurrent ?? null]);
+      return result.rows[0] ? this.mapAcademicYearRow(result.rows[0]) : undefined;
+    });
+  }
+
+  async deleteAcademicYearAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteAcademicYear(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM academic_years WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  async getTermsAsync(organizationId: string, academicYearId?: string): Promise<Term[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getTerms(organizationId, academicYearId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query('SELECT id, organization_id, academic_year_id, name, start_date, end_date, is_current FROM terms WHERE organization_id = $1 AND ($2::text IS NULL OR academic_year_id = $2) ORDER BY start_date, id', [organizationId, academicYearId || null]);
+      return result.rows.map((row: any) => this.mapTermRow(row));
+    });
+  }
+
+  async getTermByIdAsync(id: string, organizationId: string): Promise<Term | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getTermById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query('SELECT id, organization_id, academic_year_id, name, start_date, end_date, is_current FROM terms WHERE id = $1 AND organization_id = $2', [id, organizationId]);
+      return result.rows[0] ? this.mapTermRow(result.rows[0]) : undefined;
+    });
+  }
+
+  async createTermAsync(data: Omit<Term, 'id'>): Promise<Term> {
+    if (process.env.NODE_ENV !== 'production') return this.createTerm(data);
+    const id = generateId('term');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      if (data.isCurrent) await client.query('UPDATE terms SET is_current = FALSE WHERE organization_id = $1', [data.organizationId]);
+      const result = await client.query('INSERT INTO terms (id, organization_id, academic_year_id, name, start_date, end_date, is_current) SELECT $1, $2, $3, $4, $5, $6, $7 WHERE EXISTS (SELECT 1 FROM academic_years WHERE id = $3 AND organization_id = $2) RETURNING id, organization_id, academic_year_id, name, start_date, end_date, is_current', [id, data.organizationId, data.academicYearId, data.name, data.startDate, data.endDate, data.isCurrent]);
+      if (!result.rows[0]) throw new Error('INVALID_ACADEMIC_YEAR');
+      return this.mapTermRow(result.rows[0]);
+    });
+  }
+
+  async updateTermAsync(id: string, organizationId: string, updates: Partial<Term>): Promise<Term | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateTerm(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      if (updates.isCurrent) await client.query('UPDATE terms SET is_current = FALSE WHERE organization_id = $1 AND id <> $2', [organizationId, id]);
+      const result = await client.query('UPDATE terms SET academic_year_id = COALESCE($3, academic_year_id), name = COALESCE($4, name), start_date = COALESCE($5, start_date), end_date = COALESCE($6, end_date), is_current = COALESCE($7, is_current) WHERE id = $1 AND organization_id = $2 AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM academic_years WHERE id = $3 AND organization_id = $2)) RETURNING id, organization_id, academic_year_id, name, start_date, end_date, is_current', [id, organizationId, updates.academicYearId ?? null, updates.name ?? null, updates.startDate ?? null, updates.endDate ?? null, updates.isCurrent ?? null]);
+      return result.rows[0] ? this.mapTermRow(result.rows[0]) : undefined;
+    });
+  }
+
+  async deleteTermAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteTerm(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM terms WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  async getGradeLevelsAsync(organizationId: string): Promise<GradeLevel[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getGradeLevels(organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('SELECT id, organization_id, name, sequence_order FROM grade_levels WHERE organization_id = $1 ORDER BY sequence_order, id', [organizationId])).rows.map((row: any) => this.mapGradeLevelRow(row)));
+  }
+
+  async getGradeLevelByIdAsync(id: string, organizationId: string): Promise<GradeLevel | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getGradeLevelById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('SELECT id, organization_id, name, sequence_order FROM grade_levels WHERE id = $1 AND organization_id = $2', [id, organizationId]); return result.rows[0] ? this.mapGradeLevelRow(result.rows[0]) : undefined; });
+  }
+
+  async createGradeLevelAsync(data: Omit<GradeLevel, 'id'>): Promise<GradeLevel> {
+    if (process.env.NODE_ENV !== 'production') return this.createGradeLevel(data);
+    const id = generateId('grade');
+    return this.withIdentityTenant(data.organizationId, async (client) => this.mapGradeLevelRow((await client.query('INSERT INTO grade_levels (id, organization_id, name, sequence_order) VALUES ($1, $2, $3, $4) RETURNING id, organization_id, name, sequence_order', [id, data.organizationId, data.name, data.sequenceOrder])).rows[0]));
+  }
+
+  async updateGradeLevelAsync(id: string, organizationId: string, updates: Partial<GradeLevel>): Promise<GradeLevel | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateGradeLevel(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('UPDATE grade_levels SET name = COALESCE($3, name), sequence_order = COALESCE($4, sequence_order) WHERE id = $1 AND organization_id = $2 RETURNING id, organization_id, name, sequence_order', [id, organizationId, updates.name ?? null, updates.sequenceOrder ?? null]); return result.rows[0] ? this.mapGradeLevelRow(result.rows[0]) : undefined; });
+  }
+
+  async deleteGradeLevelAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteGradeLevel(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM grade_levels WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  async getClassroomsAsync(organizationId: string, gradeLevelId?: string): Promise<Classroom[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getClassrooms(organizationId, gradeLevelId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('SELECT id, organization_id, grade_level_id, name, capacity FROM classrooms WHERE organization_id = $1 AND ($2::text IS NULL OR grade_level_id = $2) ORDER BY name, id', [organizationId, gradeLevelId || null])).rows.map((row: any) => this.mapClassroomRow(row)));
+  }
+
+  async getClassroomByIdAsync(id: string, organizationId: string): Promise<Classroom | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getClassroomById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('SELECT id, organization_id, grade_level_id, name, capacity FROM classrooms WHERE id = $1 AND organization_id = $2', [id, organizationId]); return result.rows[0] ? this.mapClassroomRow(result.rows[0]) : undefined; });
+  }
+
+  async createClassroomAsync(data: Omit<Classroom, 'id'>): Promise<Classroom> {
+    if (process.env.NODE_ENV !== 'production') return this.createClassroom(data);
+    const id = generateId('class');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      const result = await client.query('INSERT INTO classrooms (id, organization_id, grade_level_id, name, capacity) SELECT $1, $2, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM grade_levels WHERE id = $3 AND organization_id = $2) RETURNING id, organization_id, grade_level_id, name, capacity', [id, data.organizationId, data.gradeLevelId, data.name, data.capacity ?? 30]);
+      if (!result.rows[0]) throw new Error('INVALID_GRADE_LEVEL');
+      return this.mapClassroomRow(result.rows[0]);
+    });
+  }
+
+  async updateClassroomAsync(id: string, organizationId: string, updates: Partial<Classroom>): Promise<Classroom | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateClassroom(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('UPDATE classrooms SET grade_level_id = COALESCE($3, grade_level_id), name = COALESCE($4, name), capacity = COALESCE($5, capacity) WHERE id = $1 AND organization_id = $2 AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM grade_levels WHERE id = $3 AND organization_id = $2)) RETURNING id, organization_id, grade_level_id, name, capacity', [id, organizationId, updates.gradeLevelId ?? null, updates.name ?? null, updates.capacity ?? null]); return result.rows[0] ? this.mapClassroomRow(result.rows[0]) : undefined; });
+  }
+
+  async deleteClassroomAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteClassroom(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM classrooms WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  async getSubjectsAsync(organizationId: string): Promise<Subject[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getSubjects(organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('SELECT id, organization_id, name, code, color, description FROM subjects WHERE organization_id = $1 ORDER BY name, id', [organizationId])).rows.map((row: any) => this.mapSubjectRow(row)));
+  }
+
+  async getSubjectByIdAsync(id: string, organizationId: string): Promise<Subject | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getSubjectById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('SELECT id, organization_id, name, code, color, description FROM subjects WHERE id = $1 AND organization_id = $2', [id, organizationId]); return result.rows[0] ? this.mapSubjectRow(result.rows[0]) : undefined; });
+  }
+
+  async createSubjectAsync(data: Omit<Subject, 'id'>): Promise<Subject> {
+    if (process.env.NODE_ENV !== 'production') return this.createSubject(data);
+    const id = generateId('sub');
+    return this.withIdentityTenant(data.organizationId, async (client) => this.mapSubjectRow((await client.query('INSERT INTO subjects (id, organization_id, name, code, color, description) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, organization_id, name, code, color, description', [id, data.organizationId, data.name, data.code, data.color ?? '#10b981', data.description ?? null])).rows[0]));
+  }
+
+  async updateSubjectAsync(id: string, organizationId: string, updates: Partial<Subject>): Promise<Subject | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateSubject(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('UPDATE subjects SET name = COALESCE($3, name), code = COALESCE($4, code), color = COALESCE($5, color), description = COALESCE($6, description) WHERE id = $1 AND organization_id = $2 RETURNING id, organization_id, name, code, color, description', [id, organizationId, updates.name ?? null, updates.code ?? null, updates.color ?? null, updates.description ?? null]); return result.rows[0] ? this.mapSubjectRow(result.rows[0]) : undefined; });
+  }
+
+  async deleteSubjectAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteSubject(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM subjects WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  private courseSelect = `SELECT c.id, c.organization_id, c.subject_id, c.term_id, c.teacher_id, c.classroom_id, c.title, c.description, c.created_at, s.name AS subject_name, u.full_name AS teacher_name, cl.name AS classroom_name FROM courses c JOIN subjects s ON s.id = c.subject_id AND s.organization_id = c.organization_id LEFT JOIN users u ON u.id = c.teacher_id AND u.organization_id = c.organization_id JOIN classrooms cl ON cl.id = c.classroom_id AND cl.organization_id = c.organization_id`;
+
+  async getCoursesAsync(organizationId: string, teacherId?: string, classroomId?: string): Promise<Course[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getCourses(organizationId, teacherId, classroomId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query(`${this.courseSelect} WHERE c.organization_id = $1 AND ($2::text IS NULL OR c.teacher_id = $2) AND ($3::text IS NULL OR c.classroom_id = $3) ORDER BY c.title, c.id`, [organizationId, teacherId || null, classroomId || null])).rows.map((row: any) => this.mapCourseRow(row)));
+  }
+
+  async getCourseByIdAsync(id: string, organizationId: string): Promise<Course | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getCourseById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query(`${this.courseSelect} WHERE c.id = $1 AND c.organization_id = $2`, [id, organizationId]); return result.rows[0] ? this.mapCourseRow(result.rows[0]) : undefined; });
+  }
+
+  async createCourseAsync(data: Omit<Course, 'id' | 'createdAt' | 'updatedAt'>): Promise<Course> {
+    if (process.env.NODE_ENV !== 'production') return this.createCourse(data);
+    const id = generateId('crs');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      const result = await client.query(`INSERT INTO courses (id, organization_id, subject_id, term_id, teacher_id, classroom_id, title, description) SELECT $1, $2, $3, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM subjects WHERE id = $3 AND organization_id = $2) AND EXISTS (SELECT 1 FROM terms WHERE id = $4 AND organization_id = $2) AND EXISTS (SELECT 1 FROM classrooms WHERE id = $6 AND organization_id = $2) AND ($5::text IS NULL OR EXISTS (SELECT 1 FROM users WHERE id = $5 AND organization_id = $2 AND role IN ('TEACHER', 'ORG_ADMIN', 'SUPER_ADMIN'))) RETURNING id`, [id, data.organizationId, data.subjectId, data.termId, data.teacherId ?? null, data.classroomId, data.title, data.description ?? null]);
+      if (!result.rows[0]) throw new Error('INVALID_COURSE_REFERENCE');
+      const courseResult = await client.query(`${this.courseSelect} WHERE c.id = $1 AND c.organization_id = $2`, [id, data.organizationId]);
+      return this.mapCourseRow(courseResult.rows[0]);
+    });
+  }
+
+  async updateCourseAsync(id: string, organizationId: string, updates: Partial<Course>): Promise<Course | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateCourse(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(`UPDATE courses SET subject_id = COALESCE($3, subject_id), term_id = COALESCE($4, term_id), teacher_id = COALESCE($5, teacher_id), classroom_id = COALESCE($6, classroom_id), title = COALESCE($7, title), description = COALESCE($8, description) WHERE id = $1 AND organization_id = $2 AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM subjects WHERE id = $3 AND organization_id = $2)) AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM terms WHERE id = $4 AND organization_id = $2)) AND ($6::text IS NULL OR EXISTS (SELECT 1 FROM classrooms WHERE id = $6 AND organization_id = $2)) RETURNING id`, [id, organizationId, updates.subjectId ?? null, updates.termId ?? null, updates.teacherId ?? null, updates.classroomId ?? null, updates.title ?? null, updates.description ?? null]);
+      if (!result.rows[0]) return undefined;
+      const courseResult = await client.query(`${this.courseSelect} WHERE c.id = $1 AND c.organization_id = $2`, [id, organizationId]);
+      return courseResult.rows[0] ? this.mapCourseRow(courseResult.rows[0]) : undefined;
+    });
+  }
+
+  async deleteCourseAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteCourse(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM courses WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
+  private enrollmentSelect = `SELECT e.id, e.organization_id, e.student_id, u.full_name AS student_name, u.email AS student_email, u.student_id_number, e.classroom_id, cl.name AS classroom_name, cl.grade_level_id, gl.name AS grade_level_name, e.academic_year_id, ay.name AS academic_year_name, e.roll_number, e.status, e.enrolled_at, e.updated_at FROM student_enrollments e JOIN users u ON u.id = e.student_id AND u.organization_id = e.organization_id JOIN classrooms cl ON cl.id = e.classroom_id AND cl.organization_id = e.organization_id JOIN grade_levels gl ON gl.id = cl.grade_level_id AND gl.organization_id = e.organization_id JOIN academic_years ay ON ay.id = e.academic_year_id AND ay.organization_id = e.organization_id`;
+
+  async getStudentEnrollmentsAsync(organizationId: string, filters?: { classroomId?: string; studentId?: string; academicYearId?: string; status?: StudentEnrollmentStatus }): Promise<StudentEnrollment[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getStudentEnrollments(organizationId, filters);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query(`${this.enrollmentSelect} WHERE e.organization_id = $1 AND ($2::text IS NULL OR e.classroom_id = $2) AND ($3::text IS NULL OR e.student_id = $3) AND ($4::text IS NULL OR e.academic_year_id = $4) AND ($5::text IS NULL OR e.status = $5) ORDER BY e.enrolled_at, e.id`, [organizationId, filters?.classroomId || null, filters?.studentId || null, filters?.academicYearId || null, filters?.status || null])).rows.map((row: any) => this.mapEnrollmentRow(row)));
+  }
+
+  async getStudentEnrollmentByIdAsync(id: string, organizationId: string): Promise<StudentEnrollment | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getStudentEnrollmentById(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query(`${this.enrollmentSelect} WHERE e.id = $1 AND e.organization_id = $2`, [id, organizationId]); return result.rows[0] ? this.mapEnrollmentRow(result.rows[0]) : undefined; });
+  }
+
+  async createStudentEnrollmentAsync(data: Omit<StudentEnrollment, 'id' | 'enrolledAt' | 'updatedAt'>): Promise<StudentEnrollment> {
+    if (process.env.NODE_ENV !== 'production') return this.createStudentEnrollment(data);
+    const id = generateId('enr');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      const result = await client.query('INSERT INTO student_enrollments (id, organization_id, student_id, classroom_id, academic_year_id, roll_number, status) SELECT $1, $2, $3, $4, $5, $6, $7 WHERE EXISTS (SELECT 1 FROM users WHERE id = $3 AND organization_id = $2 AND role = \'STUDENT\') AND EXISTS (SELECT 1 FROM classrooms WHERE id = $4 AND organization_id = $2) AND EXISTS (SELECT 1 FROM academic_years WHERE id = $5 AND organization_id = $2) RETURNING id', [id, data.organizationId, data.studentId, data.classroomId, data.academicYearId, data.rollNumber ?? null, data.status]);
+      if (!result.rows[0]) throw new Error('INVALID_ENROLLMENT_REFERENCE');
+      const enrollmentResult = await client.query(`${this.enrollmentSelect} WHERE e.id = $1 AND e.organization_id = $2`, [id, data.organizationId]);
+      await client.query('UPDATE users SET classroom_id = $3 WHERE id = $1 AND organization_id = $2 AND $4 = \'ACTIVE\'', [data.studentId, data.organizationId, data.classroomId, data.status]);
+      return this.mapEnrollmentRow(enrollmentResult.rows[0]);
+    });
+  }
+
+  async updateStudentEnrollmentAsync(id: string, organizationId: string, updates: Partial<StudentEnrollment>): Promise<StudentEnrollment | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.updateStudentEnrollment(id, organizationId, updates);
+    return this.withIdentityTenant(organizationId, async (client) => { const result = await client.query('UPDATE student_enrollments SET classroom_id = COALESCE($3, classroom_id), roll_number = COALESCE($4, roll_number), status = COALESCE($5, status), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND organization_id = $2 AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM classrooms WHERE id = $3 AND organization_id = $2)) RETURNING id', [id, organizationId, updates.classroomId ?? null, updates.rollNumber ?? null, updates.status ?? null]); if (!result.rows[0]) return undefined; const enrollmentResult = await client.query(`${this.enrollmentSelect} WHERE e.id = $1 AND e.organization_id = $2`, [id, organizationId]); return enrollmentResult.rows[0] ? this.mapEnrollmentRow(enrollmentResult.rows[0]) : undefined; });
+  }
+
+  async deleteStudentEnrollmentAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.deleteStudentEnrollment(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => (await client.query('DELETE FROM student_enrollments WHERE id = $1 AND organization_id = $2', [id, organizationId])).rowCount === 1);
+  }
+
   getAcademicYears(organizationId: string): AcademicYear[] {
     return Array.from(this.academicYears.values()).filter((y) => y.organizationId === organizationId);
   }
@@ -4194,6 +5216,136 @@ class PlatformDatabase {
     return true;
   }
 
+  private mapInvitationRow(row: any): Invitation {
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      email: row.email,
+      role: row.role,
+      inviteCode: row.invite_code,
+      tokenHash: row.token_hash || undefined,
+      fullName: row.full_name || undefined,
+      classroomId: row.classroom_id || undefined,
+      classroomName: row.classroom_name || undefined,
+      teacherSpecialization: row.teacher_specialization || undefined,
+      studentIdNumber: row.student_id_number || undefined,
+      createdBy: row.created_by || undefined,
+      createdByName: row.created_by_name || undefined,
+      expiresAt: row.expires_at?.toISOString ? row.expires_at.toISOString() : String(row.expires_at),
+      usedAt: row.used_at?.toISOString ? row.used_at.toISOString() : (row.used_at || undefined),
+      isUsed: Boolean(row.is_used),
+      createdAt: row.created_at?.toISOString ? row.created_at.toISOString() : String(row.created_at),
+    };
+  }
+
+  private invitationSelectSql() {
+    return `
+      SELECT i.id, i.organization_id, i.email, i.role, i.invite_code, i."tokenHash" AS token_hash,
+             i.full_name, i.classroom_id, c.name AS classroom_name, i.teacher_specialization,
+             i.student_id_number, i.created_by, creator.full_name AS created_by_name,
+             i.expires_at, i.used_at, i.is_used, i.created_at
+      FROM invitations i
+      LEFT JOIN classrooms c ON c.id = i.classroom_id AND c.organization_id = i.organization_id
+      LEFT JOIN users creator ON creator.id = i.created_by AND creator.organization_id = i.organization_id`;
+  }
+
+  async createInvitationAsync(data: Omit<Invitation, 'id' | 'createdAt' | 'isUsed'>): Promise<Invitation> {
+    if (process.env.NODE_ENV !== 'production') return this.createInvitation(data);
+    const id = generateId('inv');
+    return this.withIdentityTenant(data.organizationId, async (client) => {
+      const result = await client.query(
+        `INSERT INTO invitations (
+           id, organization_id, email, role, invite_code, "tokenHash", full_name,
+           classroom_id, teacher_specialization, student_id_number, created_by,
+           expires_at, is_used, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, FALSE, CURRENT_TIMESTAMP)
+         RETURNING id, organization_id, email, role, invite_code, "tokenHash", full_name,
+                   classroom_id, teacher_specialization, student_id_number, created_by,
+                   expires_at, used_at, is_used, created_at`,
+        [id, data.organizationId, data.email.trim().toLowerCase(), data.role, data.inviteCode.toUpperCase(), data.tokenHash || null, data.fullName || null, data.classroomId || null, data.teacherSpecialization || null, data.studentIdNumber || null, data.createdBy || null, data.expiresAt]
+      );
+      const invitation = this.mapInvitationRow(result.rows[0]);
+      const classroom = data.classroomId ? await client.query('SELECT name FROM classrooms WHERE id = $1 AND organization_id = $2', [data.classroomId, data.organizationId]) : undefined;
+      invitation.classroomName = classroom?.rows[0]?.name;
+      return invitation;
+    });
+  }
+
+  async getInvitationByCodeAsync(code: string): Promise<Invitation | undefined> {
+    if (process.env.NODE_ENV !== 'production') return this.getInvitationByCode(code);
+    const normalized = code.trim().toUpperCase();
+    for (const organizationId of await this.getProductionOrganizationIds()) {
+      const invitation = await this.withIdentityTenant(organizationId, async (client) => {
+        const result = await client.query(
+          `${this.invitationSelectSql()} WHERE i.organization_id = $1 AND upper(i.invite_code) = $2`,
+          [organizationId, normalized]
+        );
+        return result.rows[0] ? this.mapInvitationRow(result.rows[0]) : undefined;
+      });
+      if (invitation) return invitation;
+    }
+    return undefined;
+  }
+
+  async getPendingInvitationsByEmailAsync(email: string): Promise<Invitation[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getPendingInvitationsByEmail(email);
+    const pending: Invitation[] = [];
+    for (const organizationId of await this.getProductionOrganizationIds()) {
+      const rows = await this.withIdentityTenant(organizationId, async (client) => {
+        const result = await client.query(
+          `${this.invitationSelectSql()}
+           WHERE i.organization_id = $1 AND lower(i.email) = $2 AND i.is_used = FALSE AND i.used_at IS NULL
+             AND i.expires_at > CURRENT_TIMESTAMP
+           ORDER BY i.created_at DESC`,
+          [organizationId, email.trim().toLowerCase()]
+        );
+        return result.rows;
+      });
+      pending.push(...rows.map((row: any) => this.mapInvitationRow(row)));
+    }
+    return pending.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }
+
+  async getInvitationsByOrgAsync(organizationId: string): Promise<Invitation[]> {
+    if (process.env.NODE_ENV !== 'production') return this.getInvitationsByOrg(organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `${this.invitationSelectSql()} WHERE i.organization_id = $1 ORDER BY i.created_at DESC`,
+        [organizationId]
+      );
+      return result.rows.map((row: any) => this.mapInvitationRow(row));
+    });
+  }
+
+  async revokeInvitationAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.revokeInvitation(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `UPDATE invitations SET is_used = TRUE, used_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2 AND is_used = FALSE AND used_at IS NULL
+           AND expires_at > CURRENT_TIMESTAMP
+         RETURNING id`,
+        [id, organizationId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
+  async markInvitationUsedAsync(id: string, organizationId: string): Promise<boolean> {
+    if (process.env.NODE_ENV !== 'production') return this.markInvitationUsed(id, organizationId);
+    return this.withIdentityTenant(organizationId, async (client) => {
+      const result = await client.query(
+        `UPDATE invitations SET is_used = TRUE, used_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND organization_id = $2 AND is_used = FALSE AND used_at IS NULL
+           AND expires_at > CURRENT_TIMESTAMP
+         RETURNING id`,
+        [id, organizationId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
+
   // ==========================================
   // Rtiqa AI Engine Database Methods (Multi-Tenant)
   // ==========================================
@@ -4543,6 +5695,11 @@ class PlatformDatabase {
 
   // Reset database state (useful for automated tests)
   resetData(): void {
+    const isTestProcess = process.argv.some((arg) => arg.includes('--test') || arg.includes('/test/'));
+    if (process.env.NODE_ENV === 'production' && !isTestProcess) {
+      throw new Error('RESET_DATA_DISABLED_IN_PRODUCTION');
+    }
+
     this.organizations.clear();
     this.users.clear();
     this.academicYears.clear();

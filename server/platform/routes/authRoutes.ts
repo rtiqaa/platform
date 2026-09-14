@@ -89,6 +89,28 @@ function formatUserResponse(user: User) {
   };
 }
 
+async function formatUserResponseAsync(user: User) {
+  const memberships = await db.getMembershipsByUserIdAsync(user.id);
+  return {
+    id: user.id,
+    organizationId: user.organizationId,
+    email: user.email,
+    phone: user.phone,
+    fullName: user.fullName,
+    role: user.role,
+    avatarUrl: user.avatarUrl,
+    emailVerified: user.emailVerified ?? false,
+    phoneVerified: user.phoneVerified ?? false,
+    authProviders: user.authProviders || ['email'],
+    googleId: user.googleId,
+    classroomId: user.classroomId,
+    studentIdNumber: user.studentIdNumber,
+    teacherSpecialization: user.teacherSpecialization,
+    memberships,
+    createdAt: user.createdAt,
+  };
+}
+
 /**
  * Unified Super Admin Email Verifier
  * Reads exclusively from SUPER_ADMIN_EMAILS environment variable (comma-separated).
@@ -133,12 +155,44 @@ function generateLoginContext(user: User) {
   return { token, activeMembership, org, requiresOnboarding };
 }
 
+async function generateLoginContextAsync(user: User) {
+  const memberships = await db.getMembershipsByUserIdAsync(user.id);
+  const isSuperAdmin = user.role === 'SUPER_ADMIN';
+  const requiresOnboarding = !isSuperAdmin && memberships.length === 0;
+
+  if (isSuperAdmin) {
+    return {
+      token: generateToken(user, undefined, 'SUPER_ADMIN', undefined, 'PERSONAL'),
+      activeMembership: undefined,
+      org: undefined,
+      requiresOnboarding,
+    };
+  }
+
+  const activeMembership = memberships.find((m) => m.isDefault && m.status === 'ACTIVE') || memberships.find((m) => m.status === 'ACTIVE') || memberships[0];
+  if (!activeMembership) {
+    return {
+      token: generateToken(user, undefined, user.role, undefined, 'PERSONAL'),
+      activeMembership: undefined,
+      org: undefined,
+      requiresOnboarding,
+    };
+  }
+
+  return {
+    token: generateToken(user, activeMembership.organizationId, activeMembership.role, activeMembership.id, 'ORGANIZATION'),
+    activeMembership,
+    org: await db.getOrganizationByIdAsync(activeMembership.organizationId),
+    requiresOnboarding,
+  };
+}
+
 // ====================================================================
 // 1. STANDARD CREDENTIALS AUTH (EMAIL / PHONE & PASSWORD)
 // ====================================================================
 
 // POST /api/v1/auth/login (Support Login via Email OR Phone)
-authRouter.post('/login', loginLimiter, (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/login', loginLimiter, async (req: PlatformRequest, res: express.Response) => {
   try {
     const { email, identifier, phone, password, tenantSlug } = req.body;
     const loginIdentifier = sanitizeString(identifier || email || phone);
@@ -153,7 +207,7 @@ authRouter.post('/login', loginLimiter, (req: PlatformRequest, res: express.Resp
 
     let orgId: string | undefined = undefined;
     if (tenantSlug) {
-      const org = db.getOrganizationBySlug(sanitizeString(tenantSlug));
+      const org = await db.getOrganizationBySlugAsync(sanitizeString(tenantSlug));
       if (org) orgId = org.id;
     }
 
@@ -161,14 +215,14 @@ authRouter.post('/login', loginLimiter, (req: PlatformRequest, res: express.Resp
 
     // Check if identifier is email or phone
     if (isValidEmail(loginIdentifier)) {
-      user = db.findUserByEmail(loginIdentifier.toLowerCase(), orgId);
+      user = await db.findUserByEmailAsync(loginIdentifier.toLowerCase(), orgId);
     } else {
       const phoneNorm = normalizePhoneNumber(loginIdentifier);
       if (phoneNorm.isValid) {
-        user = db.findUserByPhone(phoneNorm.e164, orgId);
+        user = await db.findUserByPhoneAsync(phoneNorm.e164, orgId);
       } else {
         // Fallback search by email
-        user = db.findUserByEmail(loginIdentifier.toLowerCase(), orgId);
+        user = await db.findUserByEmailAsync(loginIdentifier.toLowerCase(), orgId);
       }
     }
 
@@ -194,20 +248,20 @@ authRouter.post('/login', loginLimiter, (req: PlatformRequest, res: express.Resp
 
     // Auto-promote user to SUPER_ADMIN if email is configured in SUPER_ADMIN_EMAILS
     if (isSuperAdminEmail(user.email) && user.role !== 'SUPER_ADMIN') {
-      const updatedUser = db.updateUser(user.id, undefined, { role: 'SUPER_ADMIN' });
+      const updatedUser = await db.updateUserAsync(user.id, user.organizationId!, { role: 'SUPER_ADMIN' });
       if (updatedUser) {
         user = updatedUser;
       }
     }
 
-    const { token, org, requiresOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding } = await generateLoginContextAsync(user);
 
     db.logAction(org?.id || 'platform', user.id, user.email, 'LOGIN', 'User', user.id, {}, req.ip);
 
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org,
       requiresOnboarding,
     });
@@ -217,7 +271,7 @@ authRouter.post('/login', loginLimiter, (req: PlatformRequest, res: express.Resp
 });
 
 // POST /api/v1/auth/register (Standard User Registration)
-authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/register', registerLimiter, async (req: PlatformRequest, res: express.Response) => {
   try {
     const { fullName, email, phone, password, role = 'STUDENT', tenantSlug } = req.body;
 
@@ -265,15 +319,18 @@ authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: expres
 
     // Resolve target Organization
     const targetSlug = sanitizeString(tenantSlug) || 'horizon';
-    let org = db.getOrganizationBySlug(targetSlug);
+    let org = await db.getOrganizationBySlugAsync(targetSlug);
     if (!org) {
-      org = db.getOrganizationBySlug('horizon') || db.getAllOrganizations()[0];
+      org = await db.getOrganizationBySlugAsync('horizon');
+    }
+    if (!org) {
+      return res.status(503).json({ success: false, error: 'ORGANIZATION_STORE_UNAVAILABLE' });
     }
     const orgId = org ? org.id : 'org_horizon_001';
 
     // Check duplicate email
     if (cleanEmail) {
-      const existingEmail = db.findUserByEmail(cleanEmail);
+      const existingEmail = await db.findUserByEmailAsync(cleanEmail, orgId);
       if (existingEmail) {
         return res.status(400).json({
           success: false,
@@ -285,7 +342,7 @@ authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: expres
 
     // Check duplicate phone
     if (cleanPhone) {
-      const existingPhone = db.findUserByPhone(cleanPhone);
+      const existingPhone = await db.findUserByPhoneAsync(cleanPhone, orgId);
       if (existingPhone) {
         return res.status(400).json({
           success: false,
@@ -316,7 +373,7 @@ authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: expres
     const validRoles: UserRole[] = ['STUDENT', 'TEACHER', 'PARENT', 'ORG_ADMIN'];
     const chosenRole: UserRole = validRoles.includes(role as UserRole) ? (role as UserRole) : 'STUDENT';
 
-    const newUser = db.createUser({
+    const newUser = await db.createUserAsync({
       organizationId: orgId,
       email: cleanEmail || `user_${Date.now()}@rtiqa.local`,
       phone: cleanPhone || undefined,
@@ -329,7 +386,7 @@ authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: expres
       isActive: true,
     });
 
-    const { token, org: generatedOrg, requiresOnboarding } = generateLoginContext(newUser);
+    const { token, org: generatedOrg, requiresOnboarding } = await generateLoginContextAsync(newUser);
 
     // Create verification token if email provided
     let verificationSent = false;
@@ -345,7 +402,7 @@ authRouter.post('/register', registerLimiter, (req: PlatformRequest, res: expres
     return res.status(201).json({
       success: true,
       token,
-      user: formatUserResponse(newUser),
+      user: await formatUserResponseAsync(newUser),
       organization: generatedOrg || org,
       requiresOnboarding,
       verificationSent,
@@ -394,7 +451,7 @@ authRouter.post('/phone/otp/send', otpLimiter, async (req: express.Request, res:
     const otpHash = hashOtp(otp);
 
     // Optional user matching
-    const existingUser = db.findUserByPhone(phoneNorm.e164);
+    const existingUser = await db.findUserByPhoneAsync(phoneNorm.e164);
     db.createPhoneOtp(phoneNorm.e164, otpHash, existingUser?.id, 10);
 
     const smsProvider = getActiveSmsProvider();
@@ -417,7 +474,7 @@ authRouter.post('/phone/otp/send', otpLimiter, async (req: express.Request, res:
 });
 
 // POST /api/v1/auth/phone/otp/verify (Verify OTP & Login or Register)
-authRouter.post('/phone/otp/verify', loginLimiter, (req: express.Request, res: express.Response) => {
+authRouter.post('/phone/otp/verify', loginLimiter, async (req: express.Request, res: express.Response) => {
   try {
     const { phone, code, fullName, tenantSlug } = req.body;
 
@@ -472,17 +529,20 @@ authRouter.post('/phone/otp/verify', loginLimiter, (req: express.Request, res: e
     db.markPhoneOtpUsed(activeOtp.id);
 
     // Find or create user
-    let user = db.findUserByPhone(phoneNorm.e164);
+    let user = await db.findUserByPhoneAsync(phoneNorm.e164);
 
     if (!user) {
       // Resolve organization
       const targetSlug = sanitizeString(tenantSlug) || 'horizon';
-      const org = db.getOrganizationBySlug(targetSlug) || db.getAllOrganizations()[0];
+      const org = await db.getOrganizationBySlugAsync(targetSlug);
+      if (!org) {
+        return res.status(503).json({ success: false, error: 'ORGANIZATION_STORE_UNAVAILABLE' });
+      }
       const orgId = org ? org.id : 'org_horizon_001';
 
       const userName = fullName ? sanitizeString(fullName) : `مستخدم ${phoneNorm.e164.slice(-4)}`;
 
-      user = db.createUser({
+      user = await db.createUserAsync({
         organizationId: orgId,
         email: `phone_${phoneNorm.e164.replace(/[^0-9]/g, '')}@rtiqa.local`,
         phone: phoneNorm.e164,
@@ -494,18 +554,23 @@ authRouter.post('/phone/otp/verify', loginLimiter, (req: express.Request, res: e
       });
     } else {
       // Update phoneVerified flag and link provider if not present
-      db.linkAccountProvider(user.id, 'phone', { phone: phoneNorm.e164 });
-      user = db.getUserById(user.id)!;
+      if (user.organizationId) {
+        user = (await db.updateUserAsync(user.id, user.organizationId, {
+          phone: phoneNorm.e164,
+          phoneVerified: true,
+          authProviders: Array.from(new Set([...(user.authProviders || []), 'phone'] as AuthProviderType[])),
+        })) || user;
+      }
     }
 
-    const { token, org, requiresOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding } = await generateLoginContextAsync(user);
 
     db.logAction(org?.id || 'platform', user.id, user.email, 'LOGIN_PHONE_OTP', 'User', user.id, { phone: phoneNorm.e164 }, req.ip);
 
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org,
       requiresOnboarding,
       message: 'تم التحقق وتسجيل الدخول بنجاح',
@@ -591,33 +656,31 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
     const emailNorm = profile.email.toLowerCase().trim();
 
     // 1. Look up existing user by googleId or email
-    let user = db.findUserByGoogleId(profile.sub) || db.findUserByEmail(emailNorm);
+    let user = await db.findUserByGoogleIdAsync(profile.sub) || await db.findUserByEmailAsync(emailNorm);
 
     if (user) {
       // Link Google provider safely
-      db.linkAccountProvider(user.id, 'google', {
+      const providerUpdates: Partial<User> = {
+        authProviders: Array.from(new Set([...(user.authProviders || []), 'google'] as AuthProviderType[])),
         googleId: profile.sub,
         email: emailNorm,
-      });
-      if (profile.picture && !user.avatarUrl) {
-        db.updateUser(user.id, undefined, { avatarUrl: profile.picture });
-      }
-      if (profile.email_verified && !user.emailVerified) {
-        db.updateUser(user.id, undefined, { emailVerified: true });
-      }
+        ...(profile.picture && !user.avatarUrl ? { avatarUrl: profile.picture } : {}),
+        ...(profile.email_verified && !user.emailVerified ? { emailVerified: true } : {}),
+      };
+      user = (await db.updateUserAsync(user.id, user.organizationId!, providerUpdates)) || user;
 
       // Auto-promote existing user if email is verified by Google and matches SUPER_ADMIN_EMAILS
       if (profile.email_verified && isSuperAdminEmail(emailNorm) && user.role !== 'SUPER_ADMIN') {
-        const updatedUser = db.updateUser(user.id, undefined, { role: 'SUPER_ADMIN' });
+        const updatedUser = await db.updateUserAsync(user.id, user.organizationId!, { role: 'SUPER_ADMIN' });
         if (updatedUser) {
           user = updatedUser;
         }
       }
 
-      user = db.getUserById(user.id)!;
+      user = (await db.getUserByIdAsync(user.id, user.organizationId))!;
     } else {
       // 2. Check for pending invitations for this email
-      const pendingInvitations = db.getPendingInvitationsByEmail(emailNorm);
+      const pendingInvitations = await db.getPendingInvitationsByEmailAsync(emailNorm);
 
       if (pendingInvitations.length > 0) {
         // Automatically claim the valid invitation
@@ -625,7 +688,7 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
         const assignedRole: UserRole =
           profile.email_verified && isSuperAdminEmail(emailNorm) ? 'SUPER_ADMIN' : invitation.role;
 
-        user = db.createUser({
+        user = await db.createUserAsync({
           organizationId: invitation.organizationId,
           email: emailNorm,
           fullName: invitation.fullName || profile.name || emailNorm.split('@')[0],
@@ -641,14 +704,17 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
           isActive: true,
         });
 
-        db.markInvitationUsed(invitation.id, invitation.organizationId);
+        await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
       } else {
-        // 3. New User WITHOUT organization membership
+        // 3. New users without an organization cannot be persisted by the production schema.
         // If email is verified by Google and configured in SUPER_ADMIN_EMAILS, assign SUPER_ADMIN; otherwise PENDING
         const assignedRole: UserRole =
           profile.email_verified && isSuperAdminEmail(emailNorm) ? 'SUPER_ADMIN' : 'PENDING';
 
-        user = db.createUser({
+        if (process.env.NODE_ENV === 'production') {
+          return res.status(409).json({ success: false, error: 'ORGANIZATION_REQUIRED', message: 'انضم إلى مؤسسة أو أنشئ مؤسسة قبل إكمال تسجيل Google.' });
+        }
+        user = await db.createUserAsync({
           email: emailNorm,
           fullName: profile.name || emailNorm.split('@')[0],
           avatarUrl: profile.picture,
@@ -662,7 +728,7 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
       }
     }
 
-    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = await generateLoginContextAsync(user);
 
     const logOrgId = org?.id || 'platform';
     db.logAction(logOrgId, user.id, user.email, 'LOGIN_GOOGLE', 'User', user.id, {
@@ -680,7 +746,7 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
             const authPayload = {
               type: 'GOOGLE_AUTH_SUCCESS',
               token: ${JSON.stringify(token)},
-              user: ${JSON.stringify(formatUserResponse(user))},
+              user: ${JSON.stringify(await formatUserResponseAsync(user))},
               organization: ${JSON.stringify(org || null)},
               status: ${JSON.stringify(isNewUserPendingOnboarding ? 'PENDING_ONBOARDING' : 'AUTHENTICATED')},
               requiresOnboarding: ${isNewUserPendingOnboarding}
@@ -704,7 +770,7 @@ const handleGoogleCallback = async (req: express.Request, res: express.Response)
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org || null,
       status: isNewUserPendingOnboarding ? 'PENDING_ONBOARDING' : 'AUTHENTICATED',
       requiresOnboarding: isNewUserPendingOnboarding,
@@ -740,38 +806,36 @@ authRouter.post('/google/verify-credential', loginLimiter, async (req: express.R
     const { profile } = verify;
     const emailNorm = profile.email.toLowerCase().trim();
 
-    let user = db.findUserByGoogleId(profile.sub) || db.findUserByEmail(emailNorm);
+    let user = await db.findUserByGoogleIdAsync(profile.sub) || await db.findUserByEmailAsync(emailNorm);
 
     if (user) {
-      db.linkAccountProvider(user.id, 'google', {
+      const providerUpdates: Partial<User> = {
+        authProviders: Array.from(new Set([...(user.authProviders || []), 'google'] as AuthProviderType[])),
         googleId: profile.sub,
         email: emailNorm,
-      });
-      if (profile.picture && !user.avatarUrl) {
-        db.updateUser(user.id, undefined, { avatarUrl: profile.picture });
-      }
-      if (profile.email_verified && !user.emailVerified) {
-        db.updateUser(user.id, undefined, { emailVerified: true });
-      }
+        ...(profile.picture && !user.avatarUrl ? { avatarUrl: profile.picture } : {}),
+        ...(profile.email_verified && !user.emailVerified ? { emailVerified: true } : {}),
+      };
+      user = (await db.updateUserAsync(user.id, user.organizationId!, providerUpdates)) || user;
 
       // Auto-promote existing user if email is verified by Google and matches SUPER_ADMIN_EMAILS
       if (profile.email_verified && isSuperAdminEmail(emailNorm) && user.role !== 'SUPER_ADMIN') {
-        const updatedUser = db.updateUser(user.id, undefined, { role: 'SUPER_ADMIN' });
+        const updatedUser = await db.updateUserAsync(user.id, user.organizationId!, { role: 'SUPER_ADMIN' });
         if (updatedUser) {
           user = updatedUser;
         }
       }
 
-      user = db.getUserById(user.id)!;
+      user = (await db.getUserByIdAsync(user.id, user.organizationId))!;
     } else {
-      const pendingInvitations = db.getPendingInvitationsByEmail(emailNorm);
+      const pendingInvitations = await db.getPendingInvitationsByEmailAsync(emailNorm);
 
       if (pendingInvitations.length > 0) {
         const invitation = pendingInvitations[0];
         const assignedRole: UserRole =
           profile.email_verified && isSuperAdminEmail(emailNorm) ? 'SUPER_ADMIN' : invitation.role;
 
-        user = db.createUser({
+        user = await db.createUserAsync({
           organizationId: invitation.organizationId,
           email: emailNorm,
           fullName: invitation.fullName || profile.name || emailNorm.split('@')[0],
@@ -787,13 +851,16 @@ authRouter.post('/google/verify-credential', loginLimiter, async (req: express.R
           isActive: true,
         });
 
-        db.markInvitationUsed(invitation.id, invitation.organizationId);
+        await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
       } else {
         // If email is verified by Google and configured in SUPER_ADMIN_EMAILS, assign SUPER_ADMIN; otherwise PENDING
         const assignedRole: UserRole =
           profile.email_verified && isSuperAdminEmail(emailNorm) ? 'SUPER_ADMIN' : 'PENDING';
 
-        user = db.createUser({
+        if (process.env.NODE_ENV === 'production') {
+          return res.status(409).json({ success: false, error: 'ORGANIZATION_REQUIRED', message: 'انضم إلى مؤسسة أو أنشئ مؤسسة قبل إكمال تسجيل Google.' });
+        }
+        user = await db.createUserAsync({
           email: emailNorm,
           fullName: profile.name || emailNorm.split('@')[0],
           avatarUrl: profile.picture,
@@ -807,7 +874,7 @@ authRouter.post('/google/verify-credential', loginLimiter, async (req: express.R
       }
     }
 
-    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = generateLoginContext(user);
+    const { token, org, requiresOnboarding: isNewUserPendingOnboarding } = await generateLoginContextAsync(user);
 
     const logOrgId = org?.id || 'platform';
     db.logAction(logOrgId, user.id, user.email, 'LOGIN_GOOGLE_CREDENTIAL', 'User', user.id, {
@@ -817,7 +884,7 @@ authRouter.post('/google/verify-credential', loginLimiter, async (req: express.R
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization: org || null,
       status: isNewUserPendingOnboarding ? 'PENDING_ONBOARDING' : 'AUTHENTICATED',
       requiresOnboarding: isNewUserPendingOnboarding,
@@ -835,7 +902,7 @@ authRouter.post('/google/verify-credential', loginLimiter, async (req: express.R
 // ====================================================================
 
 // POST /api/v1/auth/forgot-password (Safe user enumeration protected)
-authRouter.post('/forgot-password', forgotPasswordLimiter, (req: express.Request, res: express.Response) => {
+authRouter.post('/forgot-password', forgotPasswordLimiter, async (req: express.Request, res: express.Response) => {
   try {
     const { email } = req.body;
     if (!email) {
@@ -847,7 +914,7 @@ authRouter.post('/forgot-password', forgotPasswordLimiter, (req: express.Request
       return res.status(400).json({ success: false, error: 'INVALID_EMAIL', message: 'صيغة البريد الإلكتروني غير صالحة' });
     }
 
-    const user = db.findUserByEmail(cleanEmail);
+    const user = await db.findUserByEmailAsync(cleanEmail);
     let resetTokenValue: string | undefined = undefined;
 
     if (user && user.isActive) {
@@ -856,7 +923,7 @@ authRouter.post('/forgot-password', forgotPasswordLimiter, (req: express.Request
       db.createPasswordResetToken(user.id, user.email, tokenHash, 60);
       resetTokenValue = rawToken;
 
-      const org = user.organizationId ? db.getOrganizationById(user.organizationId) : undefined;
+      const org = user.organizationId ? await db.getOrganizationByIdAsync(user.organizationId) : undefined;
       // Send transactional password reset email asynchronously
       emailService.sendPasswordResetEmail({
         to: user.email,
@@ -883,7 +950,7 @@ authRouter.post('/forgot-password', forgotPasswordLimiter, (req: express.Request
 });
 
 // POST /api/v1/auth/reset-password (Set new password with token)
-authRouter.post('/reset-password', (req: express.Request, res: express.Response) => {
+authRouter.post('/reset-password', async (req: express.Request, res: express.Response) => {
   try {
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
@@ -919,13 +986,16 @@ authRouter.post('/reset-password', (req: express.Request, res: express.Response)
       });
     }
 
-    const user = db.getUserById(resetRecord.userId);
+    const user = await db.getUserByIdAsync(resetRecord.userId);
     if (!user) {
       return res.status(404).json({ success: false, error: 'USER_NOT_FOUND' });
     }
 
     const newHash = hashPassword(newPassword);
-    db.updateUser(user.id, undefined, { passwordHash: newHash });
+    if (!user.organizationId) {
+      return res.status(409).json({ success: false, error: 'ORGANIZATION_REQUIRED' });
+    }
+    await db.updateUserAsync(user.id, user.organizationId, { passwordHash: newHash });
     db.markPasswordResetTokenUsed(resetRecord.id);
 
     db.logAction(user.organizationId, user.id, user.email, 'RESET_PASSWORD', 'User', user.id, {}, req.ip);
@@ -940,7 +1010,7 @@ authRouter.post('/reset-password', (req: express.Request, res: express.Response)
 });
 
 // POST /api/v1/auth/change-password (Authenticated User)
-authRouter.post('/change-password', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/change-password', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   try {
     const { currentPassword, newPassword } = req.body;
     const user = req.user!;
@@ -965,14 +1035,16 @@ authRouter.post('/change-password', requireAuth, (req: PlatformRequest, res: exp
     }
 
     const newHash = hashPassword(newPassword);
-    const updated = db.updateUser(user.id, undefined, { passwordHash: newHash });
+    const updated = user.organizationId
+      ? await db.updateUserAsync(user.id, user.organizationId, { passwordHash: newHash })
+      : undefined;
 
     db.logAction(user.organizationId, user.id, user.email, 'CHANGE_PASSWORD', 'User', user.id, {}, req.ip);
 
     return res.json({
       success: true,
       message: 'تم تغيير كلمة المرور بنجاح',
-      user: updated ? formatUserResponse(updated) : undefined,
+      user: updated ? await formatUserResponseAsync(updated) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1005,7 +1077,7 @@ authRouter.post('/verify-email/send', requireAuth, (req: PlatformRequest, res: e
 });
 
 // POST /api/v1/auth/verify-email/confirm (Confirm email token)
-authRouter.post('/verify-email/confirm', (req: express.Request, res: express.Response) => {
+authRouter.post('/verify-email/confirm', async (req: express.Request, res: express.Response) => {
   try {
     const { token } = req.body;
     if (!token) {
@@ -1027,13 +1099,16 @@ authRouter.post('/verify-email/confirm', (req: express.Request, res: express.Res
       });
     }
 
-    const updated = db.updateUser(match.userId, undefined, { emailVerified: true });
+    const targetUser = await db.getUserByIdAsync(match.userId);
+    const updated = targetUser?.organizationId
+      ? await db.updateUserAsync(match.userId, targetUser.organizationId, { emailVerified: true })
+      : undefined;
     db.markEmailVerificationTokenUsed(match.id);
 
     return res.json({
       success: true,
       message: 'تم توثيق البريد الإلكتروني بنجاح',
-      user: updated ? formatUserResponse(updated) : undefined,
+      user: updated ? await formatUserResponseAsync(updated) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1075,7 +1150,7 @@ authRouter.post('/link/google', requireAuth, async (req: PlatformRequest, res: e
     }
 
     // Check if another user already has this googleId
-    const existingGoogle = db.findUserByGoogleId(googleSub);
+    const existingGoogle = await db.findUserByGoogleIdAsync(googleSub);
     if (existingGoogle && existingGoogle.id !== user.id) {
       return res.status(400).json({
         success: false,
@@ -1084,17 +1159,20 @@ authRouter.post('/link/google', requireAuth, async (req: PlatformRequest, res: e
       });
     }
 
-    const updated = db.linkAccountProvider(user.id, 'google', {
-      googleId: googleSub,
-      email: googleEmail,
-    });
+    const updated = user.organizationId
+      ? await db.updateUserAsync(user.id, user.organizationId, {
+          googleId: googleSub,
+          email: googleEmail,
+          authProviders: Array.from(new Set([...(user.authProviders || []), 'google'] as AuthProviderType[])),
+        })
+      : undefined;
 
     db.logAction(user.organizationId, user.id, user.email, 'LINK_PROVIDER', 'User', user.id, { provider: 'google' }, req.ip);
 
     return res.json({
       success: true,
       message: 'تم ربط حساب Google بنجاح',
-      user: updated ? formatUserResponse(updated) : undefined,
+      user: updated ? await formatUserResponseAsync(updated) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1102,7 +1180,7 @@ authRouter.post('/link/google', requireAuth, async (req: PlatformRequest, res: e
 });
 
 // POST /api/v1/auth/link/phone (Link verified phone to active user)
-authRouter.post('/link/phone', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/link/phone', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   try {
     const { phone, code } = req.body;
     const user = req.user!;
@@ -1124,7 +1202,7 @@ authRouter.post('/link/phone', requireAuth, (req: PlatformRequest, res: express.
     db.markPhoneOtpUsed(activeOtp.id);
 
     // Check if phone belongs to another user
-    const existingUser = db.findUserByPhone(phoneNorm.e164);
+    const existingUser = await db.findUserByPhoneAsync(phoneNorm.e164);
     if (existingUser && existingUser.id !== user.id) {
       return res.status(400).json({
         success: false,
@@ -1133,14 +1211,20 @@ authRouter.post('/link/phone', requireAuth, (req: PlatformRequest, res: express.
       });
     }
 
-    const updated = db.linkAccountProvider(user.id, 'phone', { phone: phoneNorm.e164 });
+    const updated = user.organizationId
+      ? await db.updateUserAsync(user.id, user.organizationId, {
+          phone: phoneNorm.e164,
+          phoneVerified: true,
+          authProviders: Array.from(new Set([...(user.authProviders || []), 'phone'] as AuthProviderType[])),
+        })
+      : undefined;
 
     db.logAction(user.organizationId, user.id, user.email, 'LINK_PROVIDER', 'User', user.id, { provider: 'phone' }, req.ip);
 
     return res.json({
       success: true,
       message: 'تم ربط رقم الهاتف بنجاح',
-      user: updated ? formatUserResponse(updated) : undefined,
+      user: updated ? await formatUserResponseAsync(updated) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1148,7 +1232,7 @@ authRouter.post('/link/phone', requireAuth, (req: PlatformRequest, res: express.
 });
 
 // DELETE /api/v1/auth/unlink/:provider (Unlink an authentication provider)
-authRouter.delete('/unlink/:provider', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.delete('/unlink/:provider', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   try {
     const provider = req.params.provider as AuthProviderType;
     const user = req.user!;
@@ -1157,7 +1241,9 @@ authRouter.delete('/unlink/:provider', requireAuth, (req: PlatformRequest, res: 
       return res.status(400).json({ success: false, error: 'INVALID_PROVIDER', message: 'مزود الهوية غير صالح' });
     }
 
-    const result = db.unlinkAccountProvider(user.id, provider);
+    const result = user.organizationId
+      ? await db.unlinkAccountProviderAsync(user.id, user.organizationId, provider)
+      : { success: false, error: 'USER_NOT_FOUND' };
     if (!result.success) {
       return res.status(400).json({
         success: false,
@@ -1174,7 +1260,7 @@ authRouter.delete('/unlink/:provider', requireAuth, (req: PlatformRequest, res: 
     return res.json({
       success: true,
       message: `تم إلغاء ربط ${provider} بنجاح`,
-      user: result.user ? formatUserResponse(result.user) : undefined,
+      user: result.user ? await formatUserResponseAsync(result.user) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1186,13 +1272,13 @@ authRouter.delete('/unlink/:provider', requireAuth, (req: PlatformRequest, res: 
 // ====================================================================
 
 // GET /api/v1/auth/profile (Full User Identity Profile & Memberships)
-authRouter.get('/profile', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.get('/profile', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   try {
     const user = req.user!;
     const organization = req.organization;
     return res.json({
       success: true,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       organization,
     });
   } catch {
@@ -1201,7 +1287,7 @@ authRouter.get('/profile', requireAuth, (req: PlatformRequest, res: express.Resp
 });
 
 // PUT /api/v1/auth/profile (Update User Profile Details)
-authRouter.put('/profile', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.put('/profile', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   try {
     const user = req.user!;
     const { fullName, avatarUrl, phone } = req.body;
@@ -1216,14 +1302,16 @@ authRouter.put('/profile', requireAuth, (req: PlatformRequest, res: express.Resp
       }
     }
 
-    const updated = db.updateUser(user.id, undefined, updates);
+    const updated = user.organizationId
+      ? await db.updateUserAsync(user.id, user.organizationId, updates)
+      : undefined;
 
     db.logAction(user.organizationId, user.id, user.email, 'UPDATE_PROFILE', 'User', user.id, updates, req.ip);
 
     return res.json({
       success: true,
       message: 'تم تحديث الملف الشخصي بنجاح',
-      user: updated ? formatUserResponse(updated) : undefined,
+      user: updated ? await formatUserResponseAsync(updated) : undefined,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1231,7 +1319,7 @@ authRouter.put('/profile', requireAuth, (req: PlatformRequest, res: express.Resp
 });
 
 // POST /api/v1/auth/switch-context & /api/v1/auth/switch-organization (Universal Context Switcher)
-const handleSwitchContext = (req: PlatformRequest, res: express.Response) => {
+const handleSwitchContext = async (req: PlatformRequest, res: express.Response) => {
   try {
     const { membershipId, contextType, organizationId, organizationSlug } = req.body;
     const user = req.user!;
@@ -1249,14 +1337,14 @@ const handleSwitchContext = (req: PlatformRequest, res: express.Response) => {
         },
         organization: null,
         activeRole: 'GUEST',
-        user: formatUserResponse(user),
+        user: await formatUserResponseAsync(user),
         message: 'تم التبديل بنجاح إلى المساحة الشخصية',
       });
     }
 
     // Case 2: Switch using verified membershipId (Strict Server-Side Membership Lookup)
     if (membershipId) {
-      const membership = db.getMembershipById(membershipId);
+      const membership = await db.getMembershipByIdAsync(membershipId);
       if (!membership || membership.userId !== user.id) {
         return res.status(403).json({
           success: false,
@@ -1276,7 +1364,7 @@ const handleSwitchContext = (req: PlatformRequest, res: express.Response) => {
         });
       }
 
-      const targetOrg = db.getOrganizationById(membership.organizationId);
+      const targetOrg = await db.getOrganizationByIdAsync(membership.organizationId);
       if (!targetOrg || !targetOrg.isActive) {
         return res.status(404).json({
           success: false,
@@ -1305,22 +1393,22 @@ const handleSwitchContext = (req: PlatformRequest, res: express.Response) => {
         },
         organization: targetOrg,
         activeRole: targetRole,
-        user: formatUserResponse(user),
+        user: await formatUserResponseAsync(user),
         message: `تم التبديل بنجاح إلى: ${targetOrg.name}`,
       });
     }
 
     // Case 3: Switch using organizationId or organizationSlug (Backward compatibility & Super Admin)
-    let targetOrg = organizationId ? db.getOrganizationById(organizationId) : undefined;
+    let targetOrg = organizationId ? await db.getOrganizationByIdAsync(organizationId) : undefined;
     if (!targetOrg && organizationSlug) {
-      targetOrg = db.getOrganizationBySlug(organizationSlug);
+      targetOrg = await db.getOrganizationBySlugAsync(organizationSlug);
     }
 
     if (!targetOrg) {
       return res.status(404).json({ success: false, error: 'ORGANIZATION_NOT_FOUND', message: 'المؤسسة غير موجودة' });
     }
 
-    const membership = db.getMembership(user.id, targetOrg.id);
+    const membership = await db.getMembershipAsync(user.id, targetOrg.id);
     if (!membership && user.role !== 'SUPER_ADMIN') {
       return res.status(403).json({
         success: false,
@@ -1358,7 +1446,7 @@ const handleSwitchContext = (req: PlatformRequest, res: express.Response) => {
       },
       organization: targetOrg,
       activeRole: targetRole,
-      user: formatUserResponse(user),
+      user: await formatUserResponseAsync(user),
       message: `تم التبديل بنجاح إلى: ${targetOrg.name}`,
     });
   } catch {
@@ -1370,7 +1458,7 @@ authRouter.post('/switch-context', requireAuth, handleSwitchContext);
 authRouter.post('/switch-organization', requireAuth, handleSwitchContext);
 
 // GET /api/v1/auth/me (Legacy / Context verification)
-authRouter.get('/me', requireAuth, (req: PlatformRequest, res: express.Response) => {
+authRouter.get('/me', requireAuth, async (req: PlatformRequest, res: express.Response) => {
   const activeCtx = req.activeContext || {
     type: req.organization ? ('ORGANIZATION' as const) : ('PERSONAL' as const),
     role: req.user!.role,
@@ -1380,7 +1468,7 @@ authRouter.get('/me', requireAuth, (req: PlatformRequest, res: express.Response)
   };
   return res.json({
     success: true,
-    user: formatUserResponse(req.user!),
+    user: await formatUserResponseAsync(req.user!),
     organization: req.organization,
     activeContext: activeCtx,
     activeRole: req.user!.role,
@@ -1453,7 +1541,7 @@ authRouter.post('/demo-switch', (req: PlatformRequest, res: express.Response) =>
 // ====================================================================
 // 8. SCHOOL REGISTRATION WIZARD
 // ====================================================================
-authRouter.post('/register-school', (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/register-school', async (req: PlatformRequest, res: express.Response) => {
   try {
     const { schoolName, slug, legalName, adminName, adminEmail, password, countryCode } = req.body;
     
@@ -1476,12 +1564,12 @@ authRouter.post('/register-school', (req: PlatformRequest, res: express.Response
     }
 
     // Check slug uniqueness
-    const existing = db.getOrganizationBySlug(cleanSlug);
+    const existing = await db.getOrganizationBySlugAsync(cleanSlug);
     if (existing) {
       return res.status(400).json({ success: false, error: 'SLUG_TAKEN', message: 'اسم المعرف للمدرسة مستخدم بالفعل' });
     }
 
-    const org = db.createOrganization({
+    const org = await db.createOrganizationAsync({
       name: sanitizeString(schoolName),
       slug: cleanSlug,
       legalName: legalName ? sanitizeString(legalName) : undefined,
@@ -1494,13 +1582,15 @@ authRouter.post('/register-school', (req: PlatformRequest, res: express.Response
     let admin: User;
     if (authenticatedUser) {
       // Existing user registered a new school: update active organization & role, add membership
-      db.updateUser(authenticatedUser.id, undefined, {
-        organizationId: org.id,
-        role: 'ORG_ADMIN',
-        fullName: resolvedAdminName,
-      });
+      if (process.env.NODE_ENV !== 'production') {
+        db.updateUser(authenticatedUser.id, undefined, {
+          organizationId: org.id,
+          role: 'ORG_ADMIN',
+          fullName: resolvedAdminName,
+        });
+      }
 
-      db.addMembership({
+      await db.addMembershipAsync({
         userId: authenticatedUser.id,
         organizationId: org.id,
         role: 'ORG_ADMIN',
@@ -1508,11 +1598,13 @@ authRouter.post('/register-school', (req: PlatformRequest, res: express.Response
         status: 'ACTIVE',
       });
 
-      admin = db.getUserById(authenticatedUser.id)!;
+      admin = process.env.NODE_ENV !== 'production'
+        ? db.getUserById(authenticatedUser.id)!
+        : (await db.getUserByIdAsync(authenticatedUser.id, org.id)) || authenticatedUser;
     } else {
       const passwordHash = password ? hashPassword(password) : hashPassword('RtiqaAdmin2026!');
 
-      admin = db.createUser({
+      admin = await db.createUserAsync({
         organizationId: org.id,
         fullName: resolvedAdminName,
         email: resolvedAdminEmail,
@@ -1524,64 +1616,65 @@ authRouter.post('/register-school', (req: PlatformRequest, res: express.Response
       });
     }
 
-    // Initialize Default Academic Year & Grade Level
-    const year = db.createAcademicYear({
-      organizationId: org.id,
-      name: '2026-2027',
-      startDate: '2026-09-01',
-      endDate: '2027-06-30',
-      isCurrent: true,
-    });
-
-    const term = db.createTerm({
-      organizationId: org.id,
-      academicYearId: year.id,
-      name: 'الفصل الدراسي الأول',
-      startDate: '2026-09-01',
-      endDate: '2027-01-15',
-      isCurrent: true,
-    });
-
-    const grade = db.createGradeLevel({
-      organizationId: org.id,
-      name: 'الصف العاشر',
-      sequenceOrder: 10,
-    });
-
-    const classroom = db.createClassroom({
-      organizationId: org.id,
-      gradeLevelId: grade.id,
-      name: 'شعبة 10-أ',
-      capacity: 30,
-    });
-
-    const subject = db.createSubject({
-      organizationId: org.id,
-      name: 'الرياضيات العامة',
-      code: 'MATH-10',
-      color: '#10b981',
-      description: 'منهج الرياضيات للمرحلة الثانوية',
-    });
+    const initialAcademicSetup = process.env.NODE_ENV === 'production'
+      ? undefined
+      : (() => {
+          const year = db.createAcademicYear({
+            organizationId: org.id,
+            name: '2026-2027',
+            startDate: '2026-09-01',
+            endDate: '2027-06-30',
+            isCurrent: true,
+          });
+          const term = db.createTerm({
+            organizationId: org.id,
+            academicYearId: year.id,
+            name: 'الفصل الدراسي الأول',
+            startDate: '2026-09-01',
+            endDate: '2027-01-15',
+            isCurrent: true,
+          });
+          const grade = db.createGradeLevel({
+            organizationId: org.id,
+            name: 'الصف العاشر',
+            sequenceOrder: 10,
+          });
+          const classroom = db.createClassroom({
+            organizationId: org.id,
+            gradeLevelId: grade.id,
+            name: 'شعبة 10-أ',
+            capacity: 30,
+          });
+          const subject = db.createSubject({
+            organizationId: org.id,
+            name: 'الرياضيات العامة',
+            code: 'MATH-10',
+            color: '#10b981',
+            description: 'منهج الرياضيات للمرحلة الثانوية',
+          });
+          return {
+            academicYearId: year.id,
+            termId: term.id,
+            gradeLevelId: grade.id,
+            classroomId: classroom.id,
+            subjectId: subject.id,
+          };
+        })();
 
     db.logAction(org.id, admin.id, admin.email, 'REGISTER_SCHOOL', 'Organization', org.id, {
       schoolName,
       slug: cleanSlug,
     }, req.ip);
 
-    const token = generateToken(admin);
+    const membership = await db.getMembershipAsync(admin.id, org.id);
+    const token = generateToken(admin, org.id, membership?.role || 'ORG_ADMIN', membership?.id, 'ORGANIZATION');
 
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(admin),
+      user: await formatUserResponseAsync(admin),
       organization: org,
-      initialAcademicSetup: {
-        academicYearId: year.id,
-        termId: term.id,
-        gradeLevelId: grade.id,
-        classroomId: classroom.id,
-        subjectId: subject.id,
-      },
+      initialAcademicSetup,
     });
   } catch {
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
@@ -1598,7 +1691,7 @@ authRouter.post(
   requireAuth,
   requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']),
   inviteLimiter,
-  (req: PlatformRequest, res: express.Response) => {
+  async (req: PlatformRequest, res: express.Response) => {
     try {
       const { email, role, fullName, classroomId, teacherSpecialization, studentIdNumber, expiresInDays = 7 } = req.body;
 
@@ -1616,7 +1709,7 @@ authRouter.post(
         return res.status(400).json({ success: false, error: 'INVALID_ROLE', message: 'الدور المحدد غير صالح' });
       }
 
-      const existingUser = db.findUserByEmail(normalizedEmail, req.organization!.id);
+      const existingUser = await db.findUserByEmailAsync(normalizedEmail, req.organization!.id);
       if (existingUser) {
         return res.status(400).json({
           success: false,
@@ -1625,7 +1718,7 @@ authRouter.post(
         });
       }
 
-      if (classroomId && !db.isClassroomInOrg(classroomId, req.organization!.id)) {
+      if (classroomId && !(await db.isClassroomInOrgAsync(classroomId, req.organization!.id))) {
         return res.status(400).json({
           success: false,
           error: 'INVALID_CLASSROOM',
@@ -1636,7 +1729,7 @@ authRouter.post(
       const inviteCode = generateInviteCode();
       const expiresAt = new Date(Date.now() + Math.max(1, Number(expiresInDays)) * 24 * 60 * 60 * 1000).toISOString();
 
-      const invitation = db.createInvitation({
+      const invitation = await db.createInvitationAsync({
         organizationId: req.organization!.id,
         email: normalizedEmail,
         role: role as UserRole,
@@ -1689,9 +1782,9 @@ authRouter.get(
   '/invitations',
   requireAuth,
   requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']),
-  (req: PlatformRequest, res: express.Response) => {
+  async (req: PlatformRequest, res: express.Response) => {
     try {
-      const invitations = db.getInvitationsByOrg(req.organization!.id);
+      const invitations = await db.getInvitationsByOrgAsync(req.organization!.id);
       return res.json({
         success: true,
         data: invitations,
@@ -1707,10 +1800,10 @@ authRouter.delete(
   '/invitations/:id',
   requireAuth,
   requireRoles(['ORG_ADMIN', 'SUPER_ADMIN']),
-  (req: PlatformRequest, res: express.Response) => {
+  async (req: PlatformRequest, res: express.Response) => {
     try {
       const { id } = req.params;
-      const revoked = db.revokeInvitation(id, req.organization!.id);
+      const revoked = await db.revokeInvitationAsync(id, req.organization!.id);
       if (!revoked) {
         return res.status(404).json({ success: false, error: 'NOT_FOUND', message: 'الدعوة غير موجودة' });
       }
@@ -1724,14 +1817,14 @@ authRouter.delete(
 );
 
 // GET /api/v1/auth/invitations/verify
-authRouter.get('/invitations/verify', (req: express.Request, res: express.Response) => {
+authRouter.get('/invitations/verify', async (req: express.Request, res: express.Response) => {
   try {
     const code = req.query.code as string;
     if (!code) {
       return res.status(400).json({ success: false, error: 'CODE_REQUIRED', message: 'رمز الدعوة مطلوب' });
     }
 
-    const invitation = db.getInvitationByCode(code);
+    const invitation = await db.getInvitationByCodeAsync(code);
     if (!invitation) {
       return res.status(404).json({ success: false, error: 'INVALID_CODE', message: 'رمز الدعوة غير صحيح أو غير موجود' });
     }
@@ -1744,7 +1837,7 @@ authRouter.get('/invitations/verify', (req: express.Request, res: express.Respon
       return res.status(400).json({ success: false, error: 'EXPIRED', message: 'انتهت صلاحية رمز الدعوة' });
     }
 
-    const org = db.getOrganizationById(invitation.organizationId);
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
 
     return res.json({
       success: true,
@@ -1770,7 +1863,7 @@ authRouter.get('/invitations/verify', (req: express.Request, res: express.Respon
 });
 
 // POST /api/v1/auth/invitations/accept
-authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Request, res: express.Response) => {
+authRouter.post('/invitations/accept', acceptInviteLimiter, async (req: express.Request, res: express.Response) => {
   try {
     const { code, fullName, password } = req.body;
     if (!code || !password) {
@@ -1781,7 +1874,7 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
       return res.status(400).json({ success: false, error: 'WEAK_PASSWORD', message: 'كلمة المرور يجب أن لا تقل عن 6 أحرف' });
     }
 
-    const invitation = db.getInvitationByCode(code);
+    const invitation = await db.getInvitationByCodeAsync(code);
     if (!invitation) {
       return res.status(404).json({ success: false, error: 'INVALID_CODE', message: 'رمز الدعوة غير صحيح' });
     }
@@ -1794,7 +1887,7 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
       return res.status(400).json({ success: false, error: 'EXPIRED', message: 'انتهت صلاحية رمز الدعوة' });
     }
 
-    const existing = db.findUserByEmail(invitation.email, invitation.organizationId);
+    const existing = await db.findUserByEmailAsync(invitation.email, invitation.organizationId);
     if (existing) {
       return res.status(400).json({ success: false, error: 'USER_EXISTS', message: 'الحساب مفعل مسبقاً' });
     }
@@ -1802,7 +1895,7 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
     const passwordHash = hashPassword(password);
     const resolvedName = fullName ? sanitizeString(fullName) : invitation.fullName || invitation.email.split('@')[0];
 
-    const newUser = db.createUser({
+    const newUser = await db.createUserAsync({
       organizationId: invitation.organizationId,
       email: invitation.email,
       fullName: resolvedName,
@@ -1816,10 +1909,14 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
       isActive: true,
     });
 
-    db.markInvitationUsed(invitation.id, invitation.organizationId);
+    const claimed = await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
+    if (!claimed) {
+      return res.status(409).json({ success: false, error: 'INVITATION_UNAVAILABLE', message: 'الدعوة مستخدمة أو منتهية الصلاحية' });
+    }
 
-    const org = db.getOrganizationById(invitation.organizationId);
-    const token = generateToken(newUser);
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
+    const membership = await db.getMembershipAsync(newUser.id, invitation.organizationId);
+    const token = generateToken(newUser, invitation.organizationId, membership?.role || invitation.role, membership?.id, 'ORGANIZATION');
 
     db.logAction(
       invitation.organizationId,
@@ -1835,7 +1932,7 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(newUser),
+      user: await formatUserResponseAsync(newUser),
       organization: org,
     });
   } catch {
@@ -1844,7 +1941,7 @@ authRouter.post('/invitations/accept', acceptInviteLimiter, (req: express.Reques
 });
 
 // POST /api/v1/auth/join-school (Authenticated user joins school using invite code)
-authRouter.post('/join-school', acceptInviteLimiter, (req: PlatformRequest, res: express.Response) => {
+authRouter.post('/join-school', acceptInviteLimiter, async (req: PlatformRequest, res: express.Response) => {
   try {
     const { inviteCode } = req.body;
     const user = req.user;
@@ -1857,7 +1954,7 @@ authRouter.post('/join-school', acceptInviteLimiter, (req: PlatformRequest, res:
       return res.status(400).json({ success: false, error: 'CODE_REQUIRED', message: 'رمز الدعوة مطلوب' });
     }
 
-    const invitation = db.getInvitationByCode(inviteCode);
+    const invitation = await db.getInvitationByCodeAsync(inviteCode);
     if (!invitation) {
       return res.status(404).json({ success: false, error: 'INVALID_CODE', message: 'رمز الدعوة غير صحيح' });
     }
@@ -1871,13 +1968,13 @@ authRouter.post('/join-school', acceptInviteLimiter, (req: PlatformRequest, res:
     }
 
     // Check if user already has active membership in this org
-    const existingMembership = db.getMembership(user.id, invitation.organizationId);
+    const existingMembership = await db.getMembershipAsync(user.id, invitation.organizationId);
     if (existingMembership) {
       return res.status(400).json({ success: false, error: 'ALREADY_MEMBER', message: 'لديك عضوية بالفعل في هذه المدرسة' });
     }
 
     // Add membership
-    db.addMembership({
+    await db.addMembershipAsync({
       userId: user.id,
       organizationId: invitation.organizationId,
       role: invitation.role,
@@ -1898,12 +1995,22 @@ authRouter.post('/join-school', acceptInviteLimiter, (req: PlatformRequest, res:
       if (invitation.studentIdNumber) updates.studentIdNumber = invitation.studentIdNumber;
     }
 
-    db.updateUser(user.id, undefined, updates);
-    db.markInvitationUsed(invitation.id, invitation.organizationId);
+    if (process.env.NODE_ENV !== 'production') {
+      db.updateUser(user.id, undefined, updates);
+    } else if (user.organizationId === invitation.organizationId) {
+      await db.updateUserAsync(user.id, invitation.organizationId, updates);
+    }
+    const claimed = await db.markInvitationUsedAsync(invitation.id, invitation.organizationId);
+    if (!claimed) {
+      return res.status(409).json({ success: false, error: 'INVITATION_UNAVAILABLE', message: 'الدعوة مستخدمة أو منتهية الصلاحية' });
+    }
 
-    const updatedUser = db.getUserById(user.id)!;
-    const org = db.getOrganizationById(invitation.organizationId);
-    const token = generateToken(updatedUser, invitation.organizationId, invitation.role);
+    const updatedUser = process.env.NODE_ENV !== 'production'
+      ? db.getUserById(user.id)!
+      : (await db.getUserByIdAsync(user.id, user.organizationId))!;
+    const org = await db.getOrganizationByIdAsync(invitation.organizationId);
+    const membership = await db.getMembershipAsync(user.id, invitation.organizationId);
+    const token = generateToken(updatedUser, invitation.organizationId, membership?.role || invitation.role, membership?.id, 'ORGANIZATION');
 
     db.logAction(
       invitation.organizationId,
@@ -1919,7 +2026,7 @@ authRouter.post('/join-school', acceptInviteLimiter, (req: PlatformRequest, res:
     return res.json({
       success: true,
       token,
-      user: formatUserResponse(updatedUser),
+      user: await formatUserResponseAsync(updatedUser),
       organization: org,
       message: `تم الانضمام بنجاح إلى مدرسة: ${org?.name}`,
     });
